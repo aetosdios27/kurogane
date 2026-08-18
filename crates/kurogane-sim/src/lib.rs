@@ -246,7 +246,11 @@ impl Simulation {
     }
 
     fn apply_effects(&mut self, from: NodeId, effects: Vec<Effect>) {
-        for Effect::Send { to, message } in effects {
+        for effect in effects {
+            let Effect::Send { to, message } = effect else {
+                // Persist* effects aren't message delivery; nothing to route.
+                continue;
+            };
             self.trace.push(TraceEvent::Sent {
                 at: self.clock,
                 from,
@@ -390,11 +394,20 @@ mod simulation_tests {
         from: NodeId,
         effects: Vec<Effect>,
     ) {
-        let mut pending: Vec<(NodeId, NodeId, Message)> = effects
-            .into_iter()
-            .filter(|Effect::Send { to, .. }| !isolated.contains(to))
-            .map(|Effect::Send { to, message }| (from, to, message))
-            .collect();
+        fn sends(
+            from: NodeId,
+            effects: Vec<Effect>,
+            isolated: &[NodeId],
+        ) -> impl Iterator<Item = (NodeId, NodeId, Message)> + '_ {
+            effects.into_iter().filter_map(move |effect| match effect {
+                Effect::Send { to, message } if !isolated.contains(&to) => {
+                    Some((from, to, message))
+                }
+                _ => None,
+            })
+        }
+
+        let mut pending: Vec<(NodeId, NodeId, Message)> = sends(from, effects, isolated).collect();
 
         let mut guard = 0;
         while let Some((from, to, message)) = pending.pop() {
@@ -405,17 +418,7 @@ mod simulation_tests {
                 .node_mut(to)
                 .expect("known node")
                 .step(Event::Step { from, message });
-            pending.extend(
-                response
-                    .into_iter()
-                    .filter(|Effect::Send { to, .. }| !isolated.contains(to))
-                    .map(
-                        |Effect::Send {
-                             to: respond_to,
-                             message,
-                         }| (to, respond_to, message),
-                    ),
-            );
+            pending.extend(sends(to, response, isolated));
         }
     }
 
@@ -476,16 +479,22 @@ mod simulation_tests {
             .node_mut(NodeId(1))
             .expect("known node")
             .step(Event::Tick { next_timeout: 10 });
-        for Effect::Send { to, message } in requests {
+        for effect in requests {
+            let Effect::Send { to, message } = effect else {
+                continue;
+            };
             let responses = cluster.node_mut(to).expect("known node").step(Event::Step {
                 from: NodeId(1),
                 message,
             });
-            for Effect::Send {
-                to: respond_to,
-                message,
-            } in responses
-            {
+            for effect in responses {
+                let Effect::Send {
+                    to: respond_to,
+                    message,
+                } = effect
+                else {
+                    continue;
+                };
                 cluster
                     .node_mut(respond_to)
                     .expect("known node")
@@ -508,7 +517,10 @@ mod simulation_tests {
             .node_mut(NodeId(2))
             .expect("known node")
             .step(Event::Tick { next_timeout: 10 });
-        for Effect::Send { to, message } in node2_requests {
+        for effect in node2_requests {
+            let Effect::Send { to, message } = effect else {
+                continue;
+            };
             if to != NodeId(3) {
                 continue;
             }
@@ -516,11 +528,14 @@ mod simulation_tests {
                 from: NodeId(2),
                 message,
             });
-            for Effect::Send {
-                to: respond_to,
-                message,
-            } in responses
-            {
+            for effect in responses {
+                let Effect::Send {
+                    to: respond_to,
+                    message,
+                } = effect
+                else {
+                    continue;
+                };
                 cluster
                     .node_mut(respond_to)
                     .expect("known node")
@@ -601,11 +616,10 @@ mod simulation_tests {
                 .node_mut(id)
                 .expect("known node")
                 .step(Event::Tick { next_timeout: 2 });
-            requests.extend(
-                effects
-                    .into_iter()
-                    .map(|Effect::Send { to, message }| (id, to, message)),
-            );
+            requests.extend(effects.into_iter().filter_map(|effect| match effect {
+                Effect::Send { to, message } => Some((id, to, message)),
+                _ => None,
+            }));
         }
         for &id in &peers {
             let node = cluster.node(id).expect("known node");
@@ -620,11 +634,14 @@ mod simulation_tests {
                 .node_mut(to)
                 .expect("known node")
                 .step(Event::Step { from, message });
-            for Effect::Send {
-                to: respond_to,
-                message,
-            } in responses
-            {
+            for effect in responses {
+                let Effect::Send {
+                    to: respond_to,
+                    message,
+                } = effect
+                else {
+                    continue;
+                };
                 cluster
                     .node_mut(respond_to)
                     .expect("known node")
@@ -652,16 +669,22 @@ mod simulation_tests {
             2
         );
 
-        for Effect::Send { to, message } in retry_effects {
+        for effect in retry_effects {
+            let Effect::Send { to, message } = effect else {
+                continue;
+            };
             let responses = cluster.node_mut(to).expect("known node").step(Event::Step {
                 from: NodeId(1),
                 message,
             });
-            for Effect::Send {
-                to: respond_to,
-                message,
-            } in responses
-            {
+            for effect in responses {
+                let Effect::Send {
+                    to: respond_to,
+                    message,
+                } = effect
+                else {
+                    continue;
+                };
                 cluster
                     .node_mut(respond_to)
                     .expect("known node")
@@ -688,16 +711,22 @@ mod simulation_tests {
             .node_mut(NodeId(1))
             .expect("known node")
             .step(Event::Tick { next_timeout: 10 });
-        for Effect::Send { to, message } in requests {
+        for effect in requests {
+            let Effect::Send { to, message } = effect else {
+                continue;
+            };
             let responses = cluster.node_mut(to).expect("known node").step(Event::Step {
                 from: NodeId(1),
                 message,
             });
-            for Effect::Send {
-                to: respond_to,
-                message,
-            } in responses
-            {
+            for effect in responses {
+                let Effect::Send {
+                    to: respond_to,
+                    message,
+                } = effect
+                else {
+                    continue;
+                };
                 cluster
                     .node_mut(respond_to)
                     .expect("known node")

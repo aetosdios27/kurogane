@@ -478,11 +478,20 @@ mod tests {
         from: NodeId,
         effects: Vec<Effect>,
     ) {
-        let mut pending: Vec<(NodeId, NodeId, Message)> = effects
-            .into_iter()
-            .filter(|Effect::Send { to, .. }| !isolated.contains(to))
-            .map(|Effect::Send { to, message }| (from, to, message))
-            .collect();
+        fn sends(
+            from: NodeId,
+            effects: Vec<Effect>,
+            isolated: &[NodeId],
+        ) -> impl Iterator<Item = (NodeId, NodeId, Message)> + '_ {
+            effects.into_iter().filter_map(move |effect| match effect {
+                Effect::Send { to, message } if !isolated.contains(&to) => {
+                    Some((from, to, message))
+                }
+                _ => None,
+            })
+        }
+
+        let mut pending: Vec<(NodeId, NodeId, Message)> = sends(from, effects, isolated).collect();
 
         let mut guard = 0;
         while let Some((from, to, message)) = pending.pop() {
@@ -493,17 +502,7 @@ mod tests {
                 .get_mut(&to)
                 .expect("known replica")
                 .step(Event::Step { from, message });
-            pending.extend(
-                response
-                    .into_iter()
-                    .filter(|Effect::Send { to, .. }| !isolated.contains(to))
-                    .map(
-                        |Effect::Send {
-                             to: respond_to,
-                             message,
-                         }| (to, respond_to, message),
-                    ),
-            );
+            pending.extend(sends(to, response, isolated));
         }
     }
 

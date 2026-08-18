@@ -79,7 +79,33 @@ pub enum Event {
 /// One side effect emitted by a node transition for its owner to interpret.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Effect {
-    Send { to: NodeId, message: Message },
+    Send {
+        to: NodeId,
+        message: Message,
+    },
+    /// Must be made durable before any later effect in the same returned
+    /// `Vec` is honored (in particular, any `Send` that depends on it).
+    PersistHardState {
+        term: u64,
+        voted_for: Option<NodeId>,
+    },
+    /// Splice: the durable log should be truncated to `from_index - 1`
+    /// entries, then have `entries` appended. Same before-any-dependent-Send
+    /// ordering guarantee as `PersistHardState`.
+    PersistLog {
+        from_index: u64,
+        entries: Vec<LogEntry>,
+    },
+}
+
+/// The subset of a node's state that must survive a crash: its current term
+/// and which candidate (if any) it voted for in that term. Everything else —
+/// `commit_index`, role, and leader-only bookkeeping like `next_index` — is
+/// not persistent state and is safely re-derived after a restart.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct HardState {
+    pub current_term: u64,
+    pub voted_for: Option<NodeId>,
 }
 
 /// Invalid construction of a Raft node.
@@ -135,11 +161,36 @@ pub struct Node {
 
 impl Node {
     /// Constructs a follower in term zero from a fixed, canonical membership.
+    /// A fresh node is just the degenerate case of having recovered from no
+    /// prior hard state and an empty log.
     pub fn new(
         id: NodeId,
         peers: Vec<NodeId>,
         election_timeout: u64,
         heartbeat_interval: u64,
+    ) -> Result<Self, ConfigError> {
+        Self::recover(
+            id,
+            peers,
+            election_timeout,
+            heartbeat_interval,
+            HardState::default(),
+            Vec::new(),
+        )
+    }
+
+    /// Reconstructs a node from durably persisted hard state and log after a
+    /// simulated crash. Always returns a `Follower` — role is not persistent
+    /// state, so a recovered node must win a fresh election to lead again —
+    /// and `commit_index` always starts at zero, since it isn't persistent
+    /// state either and is safely re-derived through normal replication.
+    pub fn recover(
+        id: NodeId,
+        peers: Vec<NodeId>,
+        election_timeout: u64,
+        heartbeat_interval: u64,
+        hard_state: HardState,
+        log: Vec<LogEntry>,
     ) -> Result<Self, ConfigError> {
         if peers.is_empty() {
             return Err(ConfigError::EmptyConfiguration);
@@ -164,14 +215,14 @@ impl Node {
             id,
             peers,
             role: Role::Follower,
-            current_term: 0,
-            voted_for: None,
+            current_term: hard_state.current_term,
+            voted_for: hard_state.voted_for,
             election_elapsed: 0,
             election_timeout,
             votes_granted: BTreeSet::new(),
             heartbeat_elapsed: 0,
             heartbeat_interval,
-            log: Vec::new(),
+            log,
             commit_index: 0,
             next_index: BTreeMap::new(),
             match_index: BTreeMap::new(),
@@ -615,8 +666,8 @@ mod tests {
     use std::collections::BTreeSet;
 
     use super::{
-        AppendEntries, AppendEntriesResponse, ConfigError, Effect, Event, LogEntry, Message, Node,
-        NodeId, RequestVote, RequestVoteResponse, Role,
+        AppendEntries, AppendEntriesResponse, ConfigError, Effect, Event, HardState, LogEntry,
+        Message, Node, NodeId, RequestVote, RequestVoteResponse, Role,
     };
 
     #[test]
@@ -638,6 +689,38 @@ mod tests {
         assert_eq!(node.commit_index(), 0);
         assert!(node.log().is_empty());
         assert!(node.votes_granted().is_empty());
+    }
+
+    #[test]
+    fn recover_always_yields_a_follower_with_the_given_hard_state_and_log() {
+        let peers = vec![NodeId(1), NodeId(2), NodeId(3)];
+        let hard_state = HardState {
+            current_term: 5,
+            voted_for: Some(NodeId(2)),
+        };
+        let log = vec![LogEntry {
+            term: 3,
+            command: vec![1],
+        }];
+
+        let node =
+            Node::recover(NodeId(1), peers, 1, 1, hard_state, log.clone()).expect("valid node");
+
+        assert_eq!(node.role(), Role::Follower);
+        assert_eq!(node.current_term(), 5);
+        assert_eq!(node.voted_for(), Some(NodeId(2)));
+        assert_eq!(node.log(), log.as_slice());
+        assert_eq!(node.commit_index(), 0);
+    }
+
+    #[test]
+    fn recover_validates_configuration_the_same_way_as_new() {
+        let result = Node::recover(NodeId(1), vec![], 1, 1, HardState::default(), Vec::new());
+
+        assert_eq!(
+            result.expect_err("configuration must fail"),
+            ConfigError::EmptyConfiguration
+        );
     }
 
     #[test]
