@@ -3,11 +3,13 @@
 
 use tonic::{Request, Response, Status};
 
-use crate::actor::ActorHandle;
+use crate::actor::{ActorHandle, ProposeOutcome};
 use crate::dto;
+use crate::proto::raft_client_server::RaftClient;
 use crate::proto::raft_peer_server::RaftPeer;
 use crate::proto::{
-    AppendEntriesReply, AppendEntriesRequest, RequestVoteReply, RequestVoteRequest,
+    AppendEntriesReply, AppendEntriesRequest, NotLeader, ProposeAccepted, ProposeReply,
+    ProposeRequest, RequestVoteReply, RequestVoteRequest, propose_reply,
 };
 use kurogane_raft::Message;
 
@@ -69,5 +71,48 @@ impl RaftPeer for RaftPeerService {
                 "actor returned an unexpected response type",
             )),
         }
+    }
+}
+
+pub struct RaftClientService {
+    actor: ActorHandle,
+}
+
+impl RaftClientService {
+    pub fn new(actor: ActorHandle) -> Self {
+        Self { actor }
+    }
+}
+
+#[tonic::async_trait]
+impl RaftClient for RaftClientService {
+    async fn propose(
+        &self,
+        request: Request<ProposeRequest>,
+    ) -> Result<Response<ProposeReply>, Status> {
+        let proto = request
+            .into_inner()
+            .command
+            .ok_or_else(|| Status::invalid_argument("ProposeRequest is missing its command"))?;
+        let command = dto::command_from_proto(proto)
+            .map_err(|error| Status::invalid_argument(error.to_string()))?;
+
+        let outcome = self
+            .actor
+            .propose(command)
+            .await
+            .ok_or_else(|| Status::unavailable("actor task is not running"))?;
+
+        let result = match outcome {
+            ProposeOutcome::Accepted(index) => {
+                propose_reply::Result::Accepted(ProposeAccepted { index })
+            }
+            ProposeOutcome::NotLeader(hint) => propose_reply::Result::NotLeader(NotLeader {
+                leader_id: hint.map(|id| id.0),
+            }),
+        };
+        Ok(Response::new(ProposeReply {
+            result: Some(result),
+        }))
     }
 }

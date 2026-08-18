@@ -27,7 +27,7 @@ mod tests {
     use tempfile::tempdir;
 
     use super::*;
-    use crate::actor::{self, Actor, PeerTransport};
+    use crate::actor::{self, Actor, PeerTransport, ProposeOutcome};
     use crate::storage::Storage;
 
     struct NoopTransport;
@@ -50,13 +50,13 @@ mod tests {
         // elapse; paused time auto-advances through the idle interval waits.
         tokio::time::sleep(Duration::from_millis(40)).await;
 
-        let index = handle
+        let outcome = handle
             .propose(Command::Get { key: vec![1] })
             .await
             .expect("actor task is alive");
         assert!(
-            index.is_some(),
-            "a single-node cluster should have elected itself leader by now"
+            matches!(outcome, ProposeOutcome::Accepted(_)),
+            "a single-node cluster should have elected itself leader by now, got {outcome:?}"
         );
     }
 }

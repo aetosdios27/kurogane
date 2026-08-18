@@ -19,6 +19,16 @@ pub trait PeerTransport {
     fn send(&mut self, to: NodeId, message: Message);
 }
 
+/// The result of a `propose` call: accepted at this log index, or a
+/// redirect hint (if one is known) when this node isn't the leader.
+/// Carrying the hint here means a rejected client doesn't need a second
+/// round trip just to ask who the leader is.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ProposeOutcome {
+    Accepted(u64),
+    NotLeader(Option<NodeId>),
+}
+
 /// Drives one `Replica`, persisting and dispatching the effects it returns
 /// in order — a `Persist*` effect is always applied before any `Send` after
 /// it in the same batch, matching `kurogane-raft`'s write-before-send
@@ -111,14 +121,14 @@ impl<T: PeerTransport> Actor<T> {
     }
 
     /// Proposes `command` if this node is the leader, returning its log
-    /// index. `None` if it isn't — the caller should redirect using
-    /// `leader_hint`.
-    pub fn propose(&mut self, command: Command) -> io::Result<Option<u64>> {
+    /// index. If it isn't, returns the current `leader_hint` so the caller
+    /// can redirect without a second round trip.
+    pub fn propose(&mut self, command: Command) -> io::Result<ProposeOutcome> {
         let Some((index, effects)) = self.replica.propose(command) else {
-            return Ok(None);
+            return Ok(ProposeOutcome::NotLeader(self.leader_hint));
         };
         self.dispatch(effects)?;
-        Ok(Some(index))
+        Ok(ProposeOutcome::Accepted(index))
     }
 
     fn update_leader_hint(&mut self, from: NodeId, message: &Message) {
@@ -164,7 +174,7 @@ enum ActorRequest {
     },
     Propose {
         command: Command,
-        reply: tokio::sync::oneshot::Sender<Option<u64>>,
+        reply: tokio::sync::oneshot::Sender<ProposeOutcome>,
     },
 }
 
@@ -205,10 +215,10 @@ impl ActorHandle {
             .try_send(ActorRequest::PeerResponse { from, message });
     }
 
-    /// Submits a client propose request and awaits its result. Outer
-    /// `None` means the actor task is gone; inner `None` means it wasn't
-    /// the leader.
-    pub async fn propose(&self, command: Command) -> Option<Option<u64>> {
+    /// Submits a client propose request and awaits its result. `None` means
+    /// the actor task is gone; otherwise the outcome carries either the
+    /// accepted index or a leader hint for redirection.
+    pub async fn propose(&self, command: Command) -> Option<ProposeOutcome> {
         let (reply, receiver) = tokio::sync::oneshot::channel();
         self.sender
             .send(ActorRequest::Propose { command, reply })
@@ -359,13 +369,15 @@ mod tests {
             .expect("handle event");
         assert_eq!(actor.node().role(), kurogane_raft::Role::Leader);
 
-        let index = actor
+        let outcome = actor
             .propose(Command::Set {
                 key: vec![1],
                 value: vec![9],
             })
-            .expect("propose")
-            .expect("leader accepts propose");
+            .expect("propose");
+        let ProposeOutcome::Accepted(index) = outcome else {
+            panic!("leader must accept propose, got {outcome:?}");
+        };
 
         assert_eq!(
             actor.applied_result(index),
@@ -375,7 +387,7 @@ mod tests {
     }
 
     #[test]
-    fn propose_on_a_follower_returns_none() {
+    fn propose_on_a_follower_returns_the_leader_hint() {
         let mut actor = actor(
             RaftNodeId(1),
             vec![RaftNodeId(1), RaftNodeId(2), RaftNodeId(3)],
@@ -383,14 +395,14 @@ mod tests {
             2,
         );
 
-        let result = actor
+        let outcome = actor
             .propose(Command::Set {
                 key: vec![1],
                 value: vec![2],
             })
             .expect("propose");
 
-        assert_eq!(result, None);
+        assert_eq!(outcome, ProposeOutcome::NotLeader(None));
     }
 
     #[test]
@@ -578,7 +590,7 @@ mod tests {
         // Give the spawned task a chance to process the tick before
         // proposing; propose() itself awaits a reply, so no sleep is
         // needed beyond that ordering guarantee once it's in the channel.
-        let index = handle
+        let outcome = handle
             .propose(Command::Set {
                 key: vec![1],
                 value: vec![9],
@@ -586,6 +598,38 @@ mod tests {
             .await
             .expect("actor task is alive");
 
-        assert_eq!(index, Some(1));
+        assert_eq!(outcome, ProposeOutcome::Accepted(1));
+    }
+
+    #[test]
+    fn propose_on_a_follower_carries_a_known_leader_hint() {
+        let mut actor = actor(
+            RaftNodeId(1),
+            vec![RaftNodeId(1), RaftNodeId(2), RaftNodeId(3)],
+            5,
+            2,
+        );
+        actor
+            .handle_event(Event::Step {
+                from: RaftNodeId(2),
+                message: Message::AppendEntries(kurogane_raft::AppendEntries {
+                    term: 1,
+                    leader_id: RaftNodeId(2),
+                    prev_log_index: 0,
+                    prev_log_term: 0,
+                    entries: Vec::new(),
+                    leader_commit: 0,
+                }),
+            })
+            .expect("handle event");
+
+        let outcome = actor
+            .propose(Command::Set {
+                key: vec![1],
+                value: vec![2],
+            })
+            .expect("propose");
+
+        assert_eq!(outcome, ProposeOutcome::NotLeader(Some(RaftNodeId(2))));
     }
 }
