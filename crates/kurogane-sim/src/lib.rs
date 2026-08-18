@@ -217,7 +217,7 @@ impl Simulation {
                     at: self.clock,
                     from,
                     to,
-                    message,
+                    message: message.clone(),
                 });
                 let effects = self
                     .cluster
@@ -251,7 +251,7 @@ impl Simulation {
                 at: self.clock,
                 from,
                 to,
-                message,
+                message: message.clone(),
             });
             let delay = self.rng.range_inclusive(self.min_delay, self.max_delay);
             self.inbox
@@ -514,6 +514,10 @@ mod simulation_tests {
                 message: Message::AppendEntries(AppendEntries {
                     term: 2,
                     leader_id: NodeId(2),
+                    prev_log_index: 0,
+                    prev_log_term: 0,
+                    entries: Vec::new(),
+                    leader_commit: 0,
                 }),
             });
 
@@ -529,7 +533,11 @@ mod simulation_tests {
             effects,
             vec![Effect::Send {
                 to: NodeId(2),
-                message: Message::AppendEntriesResponse(AppendEntriesResponse { term: 2 }),
+                message: Message::AppendEntriesResponse(AppendEntriesResponse {
+                    term: 2,
+                    success: true,
+                    match_index: 0,
+                }),
             }]
         );
     }

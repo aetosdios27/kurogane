@@ -32,23 +32,36 @@ pub struct RequestVoteResponse {
     pub granted: bool,
 }
 
-/// A leader heartbeat. Milestone two carries no entries; replication is
-/// milestone three's `prev_log_index`/`prev_log_term`/`entries` addition.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// One entry in a node's replicated log. `command` is opaque bytes;
+/// interpreting it as a client command is milestone four's job.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LogEntry {
+    pub term: u64,
+    pub command: Vec<u8>,
+}
+
+/// A leader's replication message. Empty `entries` is a heartbeat.
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AppendEntries {
     pub term: u64,
     pub leader_id: NodeId,
+    pub prev_log_index: u64,
+    pub prev_log_term: u64,
+    pub entries: Vec<LogEntry>,
+    pub leader_commit: u64,
 }
 
-/// The response to a heartbeat. `success` has no meaning yet: there are no
-/// entries to conflict against until milestone three.
+/// The response to an `AppendEntries`. `match_index` is meaningful only when
+/// `success` is true: how far the responder's log now matches the leader's.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct AppendEntriesResponse {
     pub term: u64,
+    pub success: bool,
+    pub match_index: u64,
 }
 
 /// A message understood by the transport-free Raft core.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Message {
     RequestVote(RequestVote),
     RequestVoteResponse(RequestVoteResponse),
@@ -57,14 +70,14 @@ pub enum Message {
 }
 
 /// One explicit input to a node transition.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Event {
     Tick { next_timeout: u64 },
     Step { from: NodeId, message: Message },
 }
 
 /// One side effect emitted by a node transition for its owner to interpret.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Effect {
     Send { to: NodeId, message: Message },
 }
@@ -114,8 +127,8 @@ pub struct Node {
     votes_granted: BTreeSet<NodeId>,
     heartbeat_elapsed: u64,
     heartbeat_interval: u64,
-    last_log_index: u64,
-    last_log_term: u64,
+    log: Vec<LogEntry>,
+    commit_index: u64,
 }
 
 impl Node {
@@ -156,8 +169,8 @@ impl Node {
             votes_granted: BTreeSet::new(),
             heartbeat_elapsed: 0,
             heartbeat_interval,
-            last_log_index: 0,
-            last_log_term: 0,
+            log: Vec::new(),
+            commit_index: 0,
         })
     }
 
@@ -202,11 +215,19 @@ impl Node {
     }
 
     pub fn last_log_index(&self) -> u64 {
-        self.last_log_index
+        self.log.len() as u64
     }
 
     pub fn last_log_term(&self) -> u64 {
-        self.last_log_term
+        self.log.last().map(|entry| entry.term).unwrap_or(0)
+    }
+
+    pub fn log(&self) -> &[LogEntry] {
+        &self.log
+    }
+
+    pub fn commit_index(&self) -> u64 {
+        self.commit_index
     }
 
     /// Applies one explicit input to this node's protocol state, returning the
@@ -248,6 +269,13 @@ impl Node {
         self.peers.binary_search(&id).is_ok()
     }
 
+    fn term_at(&self, index: u64) -> Option<u64> {
+        if index == 0 {
+            return None;
+        }
+        self.log.get((index - 1) as usize).map(|entry| entry.term)
+    }
+
     fn on_tick(&mut self, next_timeout: u64) -> Vec<Effect> {
         if self.role == Role::Leader {
             return self.on_leader_tick();
@@ -271,6 +299,9 @@ impl Node {
         self.send_heartbeats()
     }
 
+    /// Sends an empty `AppendEntries` (heartbeat) to every peer, anchored at
+    /// this node's own current log tip. Milestone three's leader-side
+    /// replication (per-peer `next_index`-driven sends) still lands separately.
     fn send_heartbeats(&self) -> Vec<Effect> {
         self.peers
             .iter()
@@ -281,6 +312,10 @@ impl Node {
                 message: Message::AppendEntries(AppendEntries {
                     term: self.current_term,
                     leader_id: self.id,
+                    prev_log_index: self.last_log_index(),
+                    prev_log_term: self.last_log_term(),
+                    entries: Vec::new(),
+                    leader_commit: self.commit_index,
                 }),
             })
             .collect()
@@ -310,8 +345,8 @@ impl Node {
                 message: Message::RequestVote(RequestVote {
                     term: self.current_term,
                     candidate_id: self.id,
-                    last_log_index: self.last_log_index,
-                    last_log_term: self.last_log_term,
+                    last_log_index: self.last_log_index(),
+                    last_log_term: self.last_log_term(),
                 }),
             })
             .collect()
@@ -333,7 +368,7 @@ impl Node {
         }
 
         let log_is_up_to_date = (request.last_log_term, request.last_log_index)
-            >= (self.last_log_term, self.last_log_index);
+            >= (self.last_log_term(), self.last_log_index());
         let already_voted_for_candidate = self.voted_for == Some(request.candidate_id);
         let can_grant =
             log_is_up_to_date && (self.voted_for.is_none() || already_voted_for_candidate);
@@ -378,14 +413,20 @@ impl Node {
         Vec::new()
     }
 
+    fn reject_append_entries(&self, from: NodeId) -> Effect {
+        Effect::Send {
+            to: from,
+            message: Message::AppendEntriesResponse(AppendEntriesResponse {
+                term: self.current_term,
+                success: false,
+                match_index: 0,
+            }),
+        }
+    }
+
     fn on_append_entries(&mut self, from: NodeId, request: AppendEntries) -> Vec<Effect> {
         if request.term < self.current_term {
-            return vec![Effect::Send {
-                to: from,
-                message: Message::AppendEntriesResponse(AppendEntriesResponse {
-                    term: self.current_term,
-                }),
-            }];
+            return vec![self.reject_append_entries(from)];
         }
 
         if request.term > self.current_term {
@@ -396,10 +437,36 @@ impl Node {
 
         self.election_elapsed = 0;
 
+        if request.prev_log_index > 0 {
+            match self.term_at(request.prev_log_index) {
+                Some(term) if term == request.prev_log_term => {}
+                _ => return vec![self.reject_append_entries(from)],
+            }
+        }
+
+        for (offset, entry) in request.entries.iter().enumerate() {
+            let index = request.prev_log_index + offset as u64 + 1;
+            match self.term_at(index) {
+                Some(existing_term) if existing_term == entry.term => {}
+                Some(_) => {
+                    self.log.truncate((index - 1) as usize);
+                    self.log.push(entry.clone());
+                }
+                None => self.log.push(entry.clone()),
+            }
+        }
+
+        if request.leader_commit > self.commit_index {
+            self.commit_index = request.leader_commit.min(self.last_log_index());
+        }
+
+        let match_index = request.prev_log_index + request.entries.len() as u64;
         vec![Effect::Send {
             to: from,
             message: Message::AppendEntriesResponse(AppendEntriesResponse {
                 term: self.current_term,
+                success: true,
+                match_index,
             }),
         }]
     }
@@ -424,14 +491,6 @@ impl Node {
     fn has_quorum(&self) -> bool {
         self.votes_granted.len() >= self.quorum_size()
     }
-
-    /// Test-only hook for exercising log-freshness scenarios before milestone
-    /// three gives nodes a real log. Not part of the public API.
-    #[cfg(test)]
-    fn set_log_tip(&mut self, last_log_index: u64, last_log_term: u64) {
-        self.last_log_index = last_log_index;
-        self.last_log_term = last_log_term;
-    }
 }
 
 #[cfg(test)]
@@ -439,8 +498,8 @@ mod tests {
     use std::collections::BTreeSet;
 
     use super::{
-        AppendEntries, AppendEntriesResponse, ConfigError, Effect, Event, Message, Node, NodeId,
-        RequestVote, RequestVoteResponse, Role,
+        AppendEntries, AppendEntriesResponse, ConfigError, Effect, Event, LogEntry, Message, Node,
+        NodeId, RequestVote, RequestVoteResponse, Role,
     };
 
     #[test]
@@ -459,6 +518,8 @@ mod tests {
         assert_eq!(node.heartbeat_interval(), 4);
         assert_eq!(node.last_log_index(), 0);
         assert_eq!(node.last_log_term(), 0);
+        assert_eq!(node.commit_index(), 0);
+        assert!(node.log().is_empty());
         assert!(node.votes_granted().is_empty());
     }
 
@@ -720,22 +781,24 @@ mod tests {
             node.votes_granted(),
             &BTreeSet::from([NodeId(1), NodeId(2)])
         );
+        let expected_heartbeat = AppendEntries {
+            term: 1,
+            leader_id: NodeId(1),
+            prev_log_index: 0,
+            prev_log_term: 0,
+            entries: Vec::new(),
+            leader_commit: 0,
+        };
         assert_eq!(
             effects,
             vec![
                 Effect::Send {
                     to: NodeId(2),
-                    message: Message::AppendEntries(AppendEntries {
-                        term: 1,
-                        leader_id: NodeId(1),
-                    }),
+                    message: Message::AppendEntries(expected_heartbeat.clone()),
                 },
                 Effect::Send {
                     to: NodeId(3),
-                    message: Message::AppendEntries(AppendEntries {
-                        term: 1,
-                        leader_id: NodeId(1),
-                    }),
+                    message: Message::AppendEntries(expected_heartbeat),
                 },
             ]
         );
@@ -763,22 +826,24 @@ mod tests {
         let effects = node.step(Event::Tick { next_timeout: 5 });
 
         assert_eq!(node.heartbeat_elapsed(), 0);
+        let expected_heartbeat = AppendEntries {
+            term: 1,
+            leader_id: NodeId(1),
+            prev_log_index: 0,
+            prev_log_term: 0,
+            entries: Vec::new(),
+            leader_commit: 0,
+        };
         assert_eq!(
             effects,
             vec![
                 Effect::Send {
                     to: NodeId(2),
-                    message: Message::AppendEntries(AppendEntries {
-                        term: 1,
-                        leader_id: NodeId(1),
-                    }),
+                    message: Message::AppendEntries(expected_heartbeat.clone()),
                 },
                 Effect::Send {
                     to: NodeId(3),
-                    message: Message::AppendEntries(AppendEntries {
-                        term: 1,
-                        leader_id: NodeId(1),
-                    }),
+                    message: Message::AppendEntries(expected_heartbeat),
                 },
             ]
         );
@@ -796,6 +861,10 @@ mod tests {
             message: Message::AppendEntries(AppendEntries {
                 term: 1,
                 leader_id: NodeId(2),
+                prev_log_index: 0,
+                prev_log_term: 0,
+                entries: Vec::new(),
+                leader_commit: 0,
             }),
         });
 
@@ -806,7 +875,11 @@ mod tests {
             effects,
             vec![Effect::Send {
                 to: NodeId(2),
-                message: Message::AppendEntriesResponse(AppendEntriesResponse { term: 1 }),
+                message: Message::AppendEntriesResponse(AppendEntriesResponse {
+                    term: 1,
+                    success: true,
+                    match_index: 0,
+                }),
             }]
         );
     }
@@ -823,6 +896,10 @@ mod tests {
             message: Message::AppendEntries(AppendEntries {
                 term: 1,
                 leader_id: NodeId(2),
+                prev_log_index: 0,
+                prev_log_term: 0,
+                entries: Vec::new(),
+                leader_commit: 0,
             }),
         });
 
@@ -833,7 +910,11 @@ mod tests {
             effects,
             vec![Effect::Send {
                 to: NodeId(2),
-                message: Message::AppendEntriesResponse(AppendEntriesResponse { term: 1 }),
+                message: Message::AppendEntriesResponse(AppendEntriesResponse {
+                    term: 1,
+                    success: true,
+                    match_index: 0,
+                }),
             }]
         );
     }
@@ -850,6 +931,10 @@ mod tests {
             message: Message::AppendEntries(AppendEntries {
                 term: 0,
                 leader_id: NodeId(2),
+                prev_log_index: 0,
+                prev_log_term: 0,
+                entries: Vec::new(),
+                leader_commit: 0,
             }),
         });
 
@@ -859,9 +944,208 @@ mod tests {
             effects,
             vec![Effect::Send {
                 to: NodeId(2),
-                message: Message::AppendEntriesResponse(AppendEntriesResponse { term: 1 }),
+                message: Message::AppendEntriesResponse(AppendEntriesResponse {
+                    term: 1,
+                    success: false,
+                    match_index: 0,
+                }),
             }]
         );
+    }
+
+    #[test]
+    fn rejects_append_entries_when_prev_log_does_not_match() {
+        let peers = vec![NodeId(1), NodeId(2), NodeId(3)];
+        let mut node = Node::new(NodeId(1), peers, 5, 2).expect("valid node");
+
+        let effects = node.step(Event::Step {
+            from: NodeId(2),
+            message: Message::AppendEntries(AppendEntries {
+                term: 1,
+                leader_id: NodeId(2),
+                prev_log_index: 3,
+                prev_log_term: 1,
+                entries: Vec::new(),
+                leader_commit: 0,
+            }),
+        });
+
+        assert!(node.log().is_empty());
+        assert_eq!(
+            effects,
+            vec![Effect::Send {
+                to: NodeId(2),
+                message: Message::AppendEntriesResponse(AppendEntriesResponse {
+                    term: 1,
+                    success: false,
+                    match_index: 0,
+                }),
+            }]
+        );
+    }
+
+    #[test]
+    fn appends_new_entries_when_prev_log_matches() {
+        let peers = vec![NodeId(1), NodeId(2), NodeId(3)];
+        let mut node = Node::new(NodeId(1), peers, 5, 2).expect("valid node");
+        let entries = vec![
+            LogEntry {
+                term: 1,
+                command: Vec::new(),
+            },
+            LogEntry {
+                term: 1,
+                command: Vec::new(),
+            },
+        ];
+
+        let effects = node.step(Event::Step {
+            from: NodeId(2),
+            message: Message::AppendEntries(AppendEntries {
+                term: 1,
+                leader_id: NodeId(2),
+                prev_log_index: 0,
+                prev_log_term: 0,
+                entries: entries.clone(),
+                leader_commit: 0,
+            }),
+        });
+
+        assert_eq!(node.log(), entries.as_slice());
+        assert_eq!(node.last_log_index(), 2);
+        assert_eq!(node.last_log_term(), 1);
+        assert_eq!(
+            effects,
+            vec![Effect::Send {
+                to: NodeId(2),
+                message: Message::AppendEntriesResponse(AppendEntriesResponse {
+                    term: 1,
+                    success: true,
+                    match_index: 2,
+                }),
+            }]
+        );
+    }
+
+    #[test]
+    fn truncates_conflicting_suffix_and_appends_leaders_entries() {
+        let peers = vec![NodeId(1), NodeId(2), NodeId(3)];
+        let mut node = Node::new(NodeId(1), peers, 5, 2).expect("valid node");
+        node.step(Event::Step {
+            from: NodeId(2),
+            message: Message::AppendEntries(AppendEntries {
+                term: 1,
+                leader_id: NodeId(2),
+                prev_log_index: 0,
+                prev_log_term: 0,
+                entries: vec![
+                    LogEntry {
+                        term: 1,
+                        command: vec![1],
+                    },
+                    LogEntry {
+                        term: 1,
+                        command: vec![2],
+                    },
+                ],
+                leader_commit: 0,
+            }),
+        });
+        assert_eq!(node.last_log_index(), 2);
+
+        let replacement = LogEntry {
+            term: 2,
+            command: vec![9],
+        };
+        let effects = node.step(Event::Step {
+            from: NodeId(2),
+            message: Message::AppendEntries(AppendEntries {
+                term: 2,
+                leader_id: NodeId(2),
+                prev_log_index: 1,
+                prev_log_term: 1,
+                entries: vec![replacement.clone()],
+                leader_commit: 0,
+            }),
+        });
+
+        assert_eq!(node.log().len(), 2);
+        assert_eq!(node.log()[1], replacement);
+        assert_eq!(
+            effects,
+            vec![Effect::Send {
+                to: NodeId(2),
+                message: Message::AppendEntriesResponse(AppendEntriesResponse {
+                    term: 2,
+                    success: true,
+                    match_index: 2,
+                }),
+            }]
+        );
+    }
+
+    #[test]
+    fn advances_commit_index_from_leader_commit_on_a_heartbeat() {
+        let peers = vec![NodeId(1), NodeId(2), NodeId(3)];
+        let mut node = Node::new(NodeId(1), peers, 5, 2).expect("valid node");
+        node.step(Event::Step {
+            from: NodeId(2),
+            message: Message::AppendEntries(AppendEntries {
+                term: 1,
+                leader_id: NodeId(2),
+                prev_log_index: 0,
+                prev_log_term: 0,
+                entries: vec![LogEntry {
+                    term: 1,
+                    command: Vec::new(),
+                }],
+                leader_commit: 0,
+            }),
+        });
+        assert_eq!(node.commit_index(), 0);
+
+        node.step(Event::Step {
+            from: NodeId(2),
+            message: Message::AppendEntries(AppendEntries {
+                term: 1,
+                leader_id: NodeId(2),
+                prev_log_index: 1,
+                prev_log_term: 1,
+                entries: Vec::new(),
+                leader_commit: 1,
+            }),
+        });
+
+        assert_eq!(node.commit_index(), 1);
+    }
+
+    #[test]
+    fn delivering_the_same_append_entries_twice_is_idempotent() {
+        let peers = vec![NodeId(1), NodeId(2), NodeId(3)];
+        let mut node = Node::new(NodeId(1), peers, 5, 2).expect("valid node");
+        let request = AppendEntries {
+            term: 1,
+            leader_id: NodeId(2),
+            prev_log_index: 0,
+            prev_log_term: 0,
+            entries: vec![LogEntry {
+                term: 1,
+                command: vec![7],
+            }],
+            leader_commit: 0,
+        };
+
+        let first = node.step(Event::Step {
+            from: NodeId(2),
+            message: Message::AppendEntries(request.clone()),
+        });
+        let second = node.step(Event::Step {
+            from: NodeId(2),
+            message: Message::AppendEntries(request),
+        });
+
+        assert_eq!(node.log().len(), 1);
+        assert_eq!(first, second);
     }
 
     #[test]
@@ -883,6 +1167,10 @@ mod tests {
             message: Message::AppendEntries(AppendEntries {
                 term: 2,
                 leader_id: NodeId(3),
+                prev_log_index: 0,
+                prev_log_term: 0,
+                entries: Vec::new(),
+                leader_commit: 0,
             }),
         });
 
@@ -893,7 +1181,11 @@ mod tests {
             effects,
             vec![Effect::Send {
                 to: NodeId(3),
-                message: Message::AppendEntriesResponse(AppendEntriesResponse { term: 2 }),
+                message: Message::AppendEntriesResponse(AppendEntriesResponse {
+                    term: 2,
+                    success: true,
+                    match_index: 0,
+                }),
             }]
         );
     }
@@ -914,7 +1206,11 @@ mod tests {
 
         let effects = node.step(Event::Step {
             from: NodeId(3),
-            message: Message::AppendEntriesResponse(AppendEntriesResponse { term: 4 }),
+            message: Message::AppendEntriesResponse(AppendEntriesResponse {
+                term: 4,
+                success: false,
+                match_index: 0,
+            }),
         });
 
         assert!(effects.is_empty());
@@ -933,6 +1229,10 @@ mod tests {
             message: Message::AppendEntries(AppendEntries {
                 term: 1,
                 leader_id: NodeId(3),
+                prev_log_index: 0,
+                prev_log_term: 0,
+                entries: Vec::new(),
+                leader_commit: 0,
             }),
         });
 
@@ -945,7 +1245,26 @@ mod tests {
     fn grants_vote_when_candidate_log_is_at_least_as_up_to_date() {
         let peers = vec![NodeId(1), NodeId(2), NodeId(3)];
         let mut node = Node::new(NodeId(1), peers, 5, 2).expect("valid node");
-        node.set_log_tip(4, 2);
+        let seed_entries = vec![1, 1, 1, 2]
+            .into_iter()
+            .map(|term| LogEntry {
+                term,
+                command: Vec::new(),
+            })
+            .collect::<Vec<_>>();
+        node.step(Event::Step {
+            from: NodeId(2),
+            message: Message::AppendEntries(AppendEntries {
+                term: 1,
+                leader_id: NodeId(2),
+                prev_log_index: 0,
+                prev_log_term: 0,
+                entries: seed_entries,
+                leader_commit: 0,
+            }),
+        });
+        assert_eq!(node.last_log_index(), 4);
+        assert_eq!(node.last_log_term(), 2);
 
         let effects = node.step(Event::Step {
             from: NodeId(2),
@@ -974,7 +1293,26 @@ mod tests {
     fn rejects_vote_when_candidate_log_is_behind_even_after_stepping_down_on_a_higher_term() {
         let peers = vec![NodeId(1), NodeId(2), NodeId(3)];
         let mut node = Node::new(NodeId(1), peers, 5, 2).expect("valid node");
-        node.set_log_tip(4, 3);
+        let seed_entries = vec![1, 2, 3, 3]
+            .into_iter()
+            .map(|term| LogEntry {
+                term,
+                command: Vec::new(),
+            })
+            .collect::<Vec<_>>();
+        node.step(Event::Step {
+            from: NodeId(2),
+            message: Message::AppendEntries(AppendEntries {
+                term: 3,
+                leader_id: NodeId(2),
+                prev_log_index: 0,
+                prev_log_term: 0,
+                entries: seed_entries,
+                leader_commit: 0,
+            }),
+        });
+        assert_eq!(node.last_log_index(), 4);
+        assert_eq!(node.last_log_term(), 3);
 
         let effects = node.step(Event::Step {
             from: NodeId(2),
