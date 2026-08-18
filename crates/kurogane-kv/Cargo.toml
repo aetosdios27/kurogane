@@ -1,0 +1,12 @@
+[package]
+name = "kurogane-kv"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+kurogane-raft = { path = "../kurogane-raft" }
+
+[lints]
+workspace = true

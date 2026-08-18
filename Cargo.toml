@@ -2,6 +2,7 @@
 members = [
     "crates/kurogane-raft",
     "crates/kurogane-sim",
+    "crates/kurogane-kv",
 ]
 resolver = "3"
 
