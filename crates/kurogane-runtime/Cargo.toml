@@ -12,6 +12,7 @@ tokio = { version = "1", features = ["rt-multi-thread", "net", "time", "sync", "
 tonic = "0.14"
 tonic-prost = "0.14"
 prost = "0.14"
+rand = "0.10.2"
 
 [build-dependencies]
 protoc-bin-vendored = "3.2.0"
@@ -23,3 +24,4 @@ workspace = true
 [dev-dependencies]
 tempfile = "3.27.0"
 tokio-stream = { version = "0.1.19", features = ["net"] }
+tokio = { version = "1", features = ["test-util"] }

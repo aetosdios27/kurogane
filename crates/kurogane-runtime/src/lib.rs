@@ -12,3 +12,4 @@ pub mod dto;
 pub mod peer_client;
 pub mod server;
 pub mod storage;
+pub mod timer;
