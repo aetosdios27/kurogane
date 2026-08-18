@@ -1,0 +1,322 @@
+//! The core Tokio task: owns one `Replica` exclusively (mirrors
+//! `decisions.md`'s "one authoritative node state owner" — concurrency is
+//! serialized here, never inside `kurogane-raft`/`kurogane-kv`), dispatches
+//! its effects, and tracks a best-effort leader hint for client redirection.
+
+use std::io;
+
+use kurogane_kv::{ApplyResult, Command, Replica, StateMachine};
+use kurogane_raft::{Effect, Event, Message, Node, NodeId};
+
+use crate::storage::Storage;
+
+/// How the actor gets a `Send` effect's message to a peer. Implementations
+/// must not block the caller on the network — queue it and return; a peer
+/// that's slow or unreachable must never stall the core loop. Dropping a
+/// message here is safe: Raft's own retry logic (the periodic heartbeat
+/// cycle) is what actually guarantees eventual delivery, not this trait.
+pub trait PeerTransport {
+    fn send(&mut self, to: NodeId, message: Message);
+}
+
+/// Drives one `Replica`, persisting and dispatching the effects it returns
+/// in order — a `Persist*` effect is always applied before any `Send` after
+/// it in the same batch, matching `kurogane-raft`'s write-before-send
+/// contract.
+pub struct Actor<T: PeerTransport> {
+    replica: Replica,
+    storage: Storage,
+    transport: T,
+    leader_hint: Option<NodeId>,
+}
+
+impl<T: PeerTransport> Actor<T> {
+    pub fn new(replica: Replica, storage: Storage, transport: T) -> Self {
+        Self {
+            replica,
+            storage,
+            transport,
+            leader_hint: None,
+        }
+    }
+
+    pub fn node(&self) -> &Node {
+        self.replica.node()
+    }
+
+    pub fn state_machine(&self) -> &StateMachine {
+        self.replica.state_machine()
+    }
+
+    pub fn applied_result(&self, index: u64) -> Option<&ApplyResult> {
+        self.replica.applied_result(index)
+    }
+
+    /// The last leader this node has seen at a current-or-newer term, for
+    /// redirecting a client `Propose` sent to the wrong node. Best-effort:
+    /// it can go stale the moment the real leader changes, same as any
+    /// cached hint in a distributed system — a client that acts on a stale
+    /// hint just gets another (fresher) one back.
+    pub fn leader_hint(&self) -> Option<NodeId> {
+        self.leader_hint
+    }
+
+    pub fn handle_event(&mut self, event: Event) -> io::Result<()> {
+        self.update_leader_hint(&event);
+        let effects = self.replica.step(event);
+        self.dispatch(effects)
+    }
+
+    /// Proposes `command` if this node is the leader, returning its log
+    /// index. `None` if it isn't — the caller should redirect using
+    /// `leader_hint`.
+    pub fn propose(&mut self, command: Command) -> io::Result<Option<u64>> {
+        let Some((index, effects)) = self.replica.propose(command) else {
+            return Ok(None);
+        };
+        self.dispatch(effects)?;
+        Ok(Some(index))
+    }
+
+    fn update_leader_hint(&mut self, event: &Event) {
+        let Event::Step {
+            message: Message::AppendEntries(request),
+            ..
+        } = event
+        else {
+            return;
+        };
+        // Mirrors on_append_entries's own stale-term rejection: a request
+        // that would be rejected tells us nothing about who's actually
+        // leading right now.
+        if request.term >= self.replica.node().current_term() {
+            self.leader_hint = Some(request.leader_id);
+        }
+    }
+
+    fn dispatch(&mut self, effects: Vec<Effect>) -> io::Result<()> {
+        for effect in &effects {
+            match effect {
+                Effect::PersistHardState { .. } | Effect::PersistLog { .. } => {
+                    self.storage.apply(effect)?;
+                }
+                Effect::Send { to, message } => {
+                    self.transport.send(*to, message.clone());
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use kurogane_raft::{NodeId as RaftNodeId, RequestVoteResponse};
+    use tempfile::tempdir;
+
+    use super::*;
+
+    struct RecordingTransport {
+        sent: Vec<(NodeId, Message)>,
+    }
+
+    impl RecordingTransport {
+        fn new() -> Self {
+            Self { sent: Vec::new() }
+        }
+    }
+
+    impl PeerTransport for RecordingTransport {
+        fn send(&mut self, to: NodeId, message: Message) {
+            self.sent.push((to, message));
+        }
+    }
+
+    fn actor(
+        id: RaftNodeId,
+        peers: Vec<RaftNodeId>,
+        election_timeout: u64,
+        heartbeat_interval: u64,
+    ) -> Actor<RecordingTransport> {
+        let node = kurogane_raft::Node::new(id, peers, election_timeout, heartbeat_interval)
+            .expect("valid node");
+        let dir = tempdir().expect("temp dir");
+        // Leaked deliberately: the tempdir must outlive the Storage, and
+        // these are short-lived unit tests, not a long-running process.
+        let path = Box::leak(Box::new(dir)).path().join("state");
+        let storage = Storage::open(path).expect("open storage");
+        Actor::new(Replica::new(node), storage, RecordingTransport::new())
+    }
+
+    #[test]
+    fn tick_that_starts_an_election_persists_and_sends_request_votes() {
+        let peers = vec![RaftNodeId(1), RaftNodeId(2), RaftNodeId(3)];
+        let mut actor = actor(RaftNodeId(1), peers, 1, 1);
+
+        actor
+            .handle_event(Event::Tick { next_timeout: 5 })
+            .expect("handle event");
+
+        assert_eq!(actor.node().role(), kurogane_raft::Role::Candidate);
+        assert_eq!(actor.node().current_term(), 1);
+        assert_eq!(
+            actor.transport.sent,
+            vec![
+                (
+                    RaftNodeId(2),
+                    Message::RequestVote(kurogane_raft::RequestVote {
+                        term: 1,
+                        candidate_id: RaftNodeId(1),
+                        last_log_index: 0,
+                        last_log_term: 0,
+                    })
+                ),
+                (
+                    RaftNodeId(3),
+                    Message::RequestVote(kurogane_raft::RequestVote {
+                        term: 1,
+                        candidate_id: RaftNodeId(1),
+                        last_log_index: 0,
+                        last_log_term: 0,
+                    })
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn propose_on_a_single_node_cluster_commits_and_applies_immediately() {
+        let mut actor = actor(RaftNodeId(1), vec![RaftNodeId(1)], 1, 1);
+        actor
+            .handle_event(Event::Tick { next_timeout: 5 })
+            .expect("handle event");
+        assert_eq!(actor.node().role(), kurogane_raft::Role::Leader);
+
+        let index = actor
+            .propose(Command::Set {
+                key: vec![1],
+                value: vec![9],
+            })
+            .expect("propose")
+            .expect("leader accepts propose");
+
+        assert_eq!(
+            actor.applied_result(index),
+            Some(&ApplyResult::Set { previous: None })
+        );
+        assert_eq!(actor.state_machine().get(&[1]), Some(&[9][..]));
+    }
+
+    #[test]
+    fn propose_on_a_follower_returns_none() {
+        let mut actor = actor(
+            RaftNodeId(1),
+            vec![RaftNodeId(1), RaftNodeId(2), RaftNodeId(3)],
+            5,
+            2,
+        );
+
+        let result = actor
+            .propose(Command::Set {
+                key: vec![1],
+                value: vec![2],
+            })
+            .expect("propose");
+
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn valid_append_entries_updates_the_leader_hint() {
+        let mut actor = actor(
+            RaftNodeId(1),
+            vec![RaftNodeId(1), RaftNodeId(2), RaftNodeId(3)],
+            5,
+            2,
+        );
+        assert_eq!(actor.leader_hint(), None);
+
+        actor
+            .handle_event(Event::Step {
+                from: RaftNodeId(2),
+                message: Message::AppendEntries(kurogane_raft::AppendEntries {
+                    term: 1,
+                    leader_id: RaftNodeId(2),
+                    prev_log_index: 0,
+                    prev_log_term: 0,
+                    entries: Vec::new(),
+                    leader_commit: 0,
+                }),
+            })
+            .expect("handle event");
+
+        assert_eq!(actor.leader_hint(), Some(RaftNodeId(2)));
+    }
+
+    #[test]
+    fn a_stale_term_append_entries_does_not_update_the_leader_hint() {
+        let mut actor = actor(
+            RaftNodeId(1),
+            vec![RaftNodeId(1), RaftNodeId(2), RaftNodeId(3)],
+            1,
+            1,
+        );
+        actor
+            .handle_event(Event::Tick { next_timeout: 5 })
+            .expect("handle event");
+        assert_eq!(actor.node().current_term(), 1);
+
+        actor
+            .handle_event(Event::Step {
+                from: RaftNodeId(3),
+                message: Message::AppendEntries(kurogane_raft::AppendEntries {
+                    term: 0,
+                    leader_id: RaftNodeId(3),
+                    prev_log_index: 0,
+                    prev_log_term: 0,
+                    entries: Vec::new(),
+                    leader_commit: 0,
+                }),
+            })
+            .expect("handle event");
+
+        assert_eq!(actor.leader_hint(), None);
+    }
+
+    #[test]
+    fn granting_a_vote_persists_hard_state_durably() {
+        let peers = vec![RaftNodeId(1), RaftNodeId(2), RaftNodeId(3)];
+        let dir = tempdir().expect("temp dir");
+        let path = dir.path().join("state");
+        let node = kurogane_raft::Node::new(RaftNodeId(1), peers, 5, 2).expect("valid node");
+        let storage = Storage::open(&path).expect("open storage");
+        let mut actor = Actor::new(Replica::new(node), storage, RecordingTransport::new());
+
+        actor
+            .handle_event(Event::Step {
+                from: RaftNodeId(2),
+                message: Message::RequestVote(kurogane_raft::RequestVote {
+                    term: 1,
+                    candidate_id: RaftNodeId(2),
+                    last_log_index: 0,
+                    last_log_term: 0,
+                }),
+            })
+            .expect("handle event");
+
+        assert_eq!(
+            actor.transport.sent,
+            vec![(
+                RaftNodeId(2),
+                Message::RequestVoteResponse(RequestVoteResponse {
+                    term: 1,
+                    granted: true,
+                })
+            )]
+        );
+
+        let reopened = Storage::open(&path).expect("reopen storage");
+        assert_eq!(reopened.hard_state().current_term, 1);
+        assert_eq!(reopened.hard_state().voted_for, Some(RaftNodeId(2)));
+    }
+}

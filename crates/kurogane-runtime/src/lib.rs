@@ -6,5 +6,6 @@ pub mod proto {
     tonic::include_proto!("kurogane");
 }
 
+pub mod actor;
 pub mod dto;
 pub mod storage;
