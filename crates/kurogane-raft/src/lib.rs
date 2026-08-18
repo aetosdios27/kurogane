@@ -156,14 +156,29 @@ impl Node {
     pub fn step(&mut self, event: Event) -> Vec<Effect> {
         match event {
             Event::Tick { next_timeout } => self.on_tick(next_timeout),
-            Event::Step { from, message } => match message {
-                Message::RequestVote(request) => self.on_request_vote(from, request),
-                Message::RequestVoteResponse(response) => {
-                    self.on_request_vote_response(from, response);
-                    Vec::new()
+            Event::Step { from, message } => {
+                if !self.is_member(from) {
+                    return Vec::new();
                 }
-            },
+
+                match message {
+                    Message::RequestVote(request) => {
+                        if request.candidate_id != from {
+                            return Vec::new();
+                        }
+                        self.on_request_vote(from, request)
+                    }
+                    Message::RequestVoteResponse(response) => {
+                        self.on_request_vote_response(from, response);
+                        Vec::new()
+                    }
+                }
+            }
         }
+    }
+
+    fn is_member(&self, id: NodeId) -> bool {
+        self.peers.binary_search(&id).is_ok()
     }
 
     fn on_tick(&mut self, next_timeout: u64) -> Vec<Effect> {
@@ -589,6 +604,66 @@ mod tests {
         assert!(effects.is_empty());
         assert_eq!(node.role(), Role::Candidate);
         assert_eq!(node.current_term(), 2);
+        assert_eq!(node.votes_granted(), &BTreeSet::from([NodeId(1)]));
+    }
+
+    #[test]
+    fn ignores_request_vote_from_a_nonmember_node_id() {
+        let peers = vec![NodeId(1), NodeId(2), NodeId(3)];
+        let mut node = Node::new(NodeId(1), peers, 5).expect("valid node");
+
+        let effects = node.step(Event::Step {
+            from: NodeId(9),
+            message: Message::RequestVote(RequestVote {
+                term: 1,
+                candidate_id: NodeId(9),
+                last_log_index: 0,
+                last_log_term: 0,
+            }),
+        });
+
+        assert!(effects.is_empty());
+        assert_eq!(node.current_term(), 0);
+        assert_eq!(node.voted_for(), None);
+    }
+
+    #[test]
+    fn ignores_request_vote_whose_candidate_id_does_not_match_the_sender() {
+        let peers = vec![NodeId(1), NodeId(2), NodeId(3)];
+        let mut node = Node::new(NodeId(1), peers, 5).expect("valid node");
+
+        let effects = node.step(Event::Step {
+            from: NodeId(2),
+            message: Message::RequestVote(RequestVote {
+                term: 1,
+                candidate_id: NodeId(3),
+                last_log_index: 0,
+                last_log_term: 0,
+            }),
+        });
+
+        assert!(effects.is_empty());
+        assert_eq!(node.current_term(), 0);
+        assert_eq!(node.voted_for(), None);
+    }
+
+    #[test]
+    fn a_nonmember_vote_response_never_counts_toward_quorum() {
+        let peers = vec![NodeId(1), NodeId(2), NodeId(3)];
+        let mut node = Node::new(NodeId(1), peers, 1).expect("valid node");
+        node.step(Event::Tick { next_timeout: 5 });
+        assert_eq!(node.role(), Role::Candidate);
+
+        let effects = node.step(Event::Step {
+            from: NodeId(9),
+            message: Message::RequestVoteResponse(RequestVoteResponse {
+                term: 1,
+                granted: true,
+            }),
+        });
+
+        assert!(effects.is_empty());
+        assert_eq!(node.role(), Role::Candidate);
         assert_eq!(node.votes_granted(), &BTreeSet::from([NodeId(1)]));
     }
 
