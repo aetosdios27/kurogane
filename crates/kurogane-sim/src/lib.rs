@@ -485,11 +485,11 @@ mod simulation_tests {
     use std::collections::BTreeMap;
 
     use kurogane_raft::{
-        AppendEntries, AppendEntriesResponse, Effect, Event, Message, Node, NodeId, RequestVote,
-        RequestVoteResponse, Role,
+        AppendEntries, AppendEntriesResponse, Effect, Event, LogEntry, Message, Node, NodeId,
+        RequestVote, RequestVoteResponse, Role,
     };
 
-    use super::{Cluster, Simulation};
+    use super::{Cluster, DurableState, Simulation};
 
     fn three_node_cluster(election_timeout: u64, heartbeat_interval: u64) -> Cluster {
         let peers = [NodeId(1), NodeId(2), NodeId(3)];
@@ -1114,6 +1114,157 @@ mod simulation_tests {
                 .iter()
                 .all(|entry| entry.command != vec![b'C']),
             "an uncommitted entry from a deposed leader must not survive"
+        );
+    }
+
+    #[test]
+    fn a_node_that_granted_a_vote_refuses_to_double_vote_after_a_simulated_crash() {
+        let peers = vec![NodeId(1), NodeId(2), NodeId(3)];
+        let mut node = Node::new(NodeId(1), peers.clone(), 5, 2).expect("valid node");
+
+        let mut durable = DurableState::default();
+        for effect in &node.step(Event::Step {
+            from: NodeId(2),
+            message: Message::RequestVote(RequestVote {
+                term: 1,
+                candidate_id: NodeId(2),
+                last_log_index: 0,
+                last_log_term: 0,
+            }),
+        }) {
+            durable.apply(effect);
+        }
+        assert_eq!(node.voted_for(), Some(NodeId(2)));
+
+        // The process crashes here: only what was actually persisted above
+        // survives. Rebuilding from that (not from `node`, which is gone)
+        // is what a real restart would see.
+        let mut recovered = Node::recover(
+            NodeId(1),
+            peers,
+            5,
+            2,
+            durable.hard_state(),
+            durable.log().to_vec(),
+        )
+        .expect("valid node");
+        assert_eq!(recovered.role(), Role::Follower);
+        assert_eq!(recovered.current_term(), 1);
+        assert_eq!(recovered.voted_for(), Some(NodeId(2)));
+
+        let effects = recovered.step(Event::Step {
+            from: NodeId(3),
+            message: Message::RequestVote(RequestVote {
+                term: 1,
+                candidate_id: NodeId(3),
+                last_log_index: 0,
+                last_log_term: 0,
+            }),
+        });
+
+        assert_eq!(recovered.voted_for(), Some(NodeId(2)));
+        assert_eq!(
+            effects,
+            vec![Effect::Send {
+                to: NodeId(3),
+                message: Message::RequestVoteResponse(RequestVoteResponse {
+                    term: 1,
+                    granted: false,
+                }),
+            }]
+        );
+    }
+
+    #[test]
+    fn a_followers_accepted_entries_survive_a_simulated_crash() {
+        let peers = vec![NodeId(1), NodeId(2), NodeId(3)];
+        let mut node = Node::new(NodeId(1), peers.clone(), 5, 2).expect("valid node");
+
+        let mut durable = DurableState::default();
+        for effect in &node.step(Event::Step {
+            from: NodeId(2),
+            message: Message::AppendEntries(AppendEntries {
+                term: 1,
+                leader_id: NodeId(2),
+                prev_log_index: 0,
+                prev_log_term: 0,
+                entries: vec![LogEntry {
+                    term: 1,
+                    command: vec![7],
+                }],
+                leader_commit: 0,
+            }),
+        }) {
+            durable.apply(effect);
+        }
+        assert_eq!(node.log().len(), 1);
+
+        let recovered = Node::recover(
+            NodeId(1),
+            peers,
+            5,
+            2,
+            durable.hard_state(),
+            durable.log().to_vec(),
+        )
+        .expect("valid node");
+
+        assert_eq!(recovered.role(), Role::Follower);
+        assert_eq!(recovered.current_term(), 1);
+        assert_eq!(
+            recovered.log(),
+            &[LogEntry {
+                term: 1,
+                command: vec![7],
+            }]
+        );
+    }
+
+    #[test]
+    fn a_leaders_proposed_entry_survives_a_simulated_crash_and_recovers_as_a_follower() {
+        let peers = vec![NodeId(1), NodeId(2), NodeId(3)];
+        let mut node = Node::new(NodeId(1), peers.clone(), 1, 1).expect("valid node");
+
+        let mut durable = DurableState::default();
+        for effect in &node.step(Event::Tick { next_timeout: 5 }) {
+            durable.apply(effect);
+        }
+        for effect in &node.step(Event::Step {
+            from: NodeId(2),
+            message: Message::RequestVoteResponse(RequestVoteResponse {
+                term: 1,
+                granted: true,
+            }),
+        }) {
+            durable.apply(effect);
+        }
+        assert_eq!(node.role(), Role::Leader);
+
+        let (_, effects) = node.propose(vec![9]).expect("leader accepts propose");
+        for effect in &effects {
+            durable.apply(effect);
+        }
+
+        // The leader crashes here, having only ever announced its candidacy
+        // and proposed one entry -- it never told anyone the entry existed.
+        let recovered = Node::recover(
+            NodeId(1),
+            peers,
+            1,
+            1,
+            durable.hard_state(),
+            durable.log().to_vec(),
+        )
+        .expect("valid node");
+
+        assert_eq!(recovered.role(), Role::Follower);
+        assert_eq!(recovered.current_term(), 1);
+        assert_eq!(
+            recovered.log(),
+            &[LogEntry {
+                term: 1,
+                command: vec![9],
+            }]
         );
     }
 }
