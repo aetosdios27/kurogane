@@ -1,6 +1,6 @@
 //! Transport-free types and state ownership for Kurogane's Raft core.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt;
 
@@ -129,6 +129,8 @@ pub struct Node {
     heartbeat_interval: u64,
     log: Vec<LogEntry>,
     commit_index: u64,
+    next_index: BTreeMap<NodeId, u64>,
+    match_index: BTreeMap<NodeId, u64>,
 }
 
 impl Node {
@@ -171,6 +173,8 @@ impl Node {
             heartbeat_interval,
             log: Vec::new(),
             commit_index: 0,
+            next_index: BTreeMap::new(),
+            match_index: BTreeMap::new(),
         })
     }
 
@@ -257,8 +261,7 @@ impl Node {
                         self.on_append_entries(from, request)
                     }
                     Message::AppendEntriesResponse(response) => {
-                        self.on_append_entries_response(response);
-                        Vec::new()
+                        self.on_append_entries_response(from, response)
                     }
                 }
             }
@@ -296,29 +299,62 @@ impl Node {
         }
 
         self.heartbeat_elapsed = 0;
-        self.send_heartbeats()
+        self.broadcast_append_entries()
     }
 
-    /// Sends an empty `AppendEntries` (heartbeat) to every peer, anchored at
-    /// this node's own current log tip. Milestone three's leader-side
-    /// replication (per-peer `next_index`-driven sends) still lands separately.
-    fn send_heartbeats(&self) -> Vec<Effect> {
+    /// Builds the `AppendEntries` this node, as leader, owes `peer` right now:
+    /// a heartbeat when `peer` is fully caught up, real entries otherwise.
+    fn append_entries_for(&self, peer: NodeId) -> AppendEntries {
+        let next_index = *self
+            .next_index
+            .get(&peer)
+            .expect("next_index tracked for every peer while leader");
+        let prev_log_index = next_index - 1;
+        let prev_log_term = if prev_log_index == 0 {
+            0
+        } else {
+            self.log[prev_log_index as usize - 1].term
+        };
+
+        AppendEntries {
+            term: self.current_term,
+            leader_id: self.id,
+            prev_log_index,
+            prev_log_term,
+            entries: self.log[next_index as usize - 1..].to_vec(),
+            leader_commit: self.commit_index,
+        }
+    }
+
+    fn broadcast_append_entries(&self) -> Vec<Effect> {
         self.peers
             .iter()
             .copied()
             .filter(|&peer| peer != self.id)
             .map(|peer| Effect::Send {
                 to: peer,
-                message: Message::AppendEntries(AppendEntries {
-                    term: self.current_term,
-                    leader_id: self.id,
-                    prev_log_index: self.last_log_index(),
-                    prev_log_term: self.last_log_term(),
-                    entries: Vec::new(),
-                    leader_commit: self.commit_index,
-                }),
+                message: Message::AppendEntries(self.append_entries_for(peer)),
             })
             .collect()
+    }
+
+    /// Transitions this node to `Leader`, (re)seeding per-peer replication
+    /// state, and returns the immediate `AppendEntries` round that
+    /// establishes its authority right away rather than waiting for the next
+    /// heartbeat tick.
+    fn become_leader(&mut self) -> Vec<Effect> {
+        self.role = Role::Leader;
+        self.heartbeat_elapsed = 0;
+
+        let next_index = self.last_log_index() + 1;
+        self.next_index.clear();
+        self.match_index.clear();
+        for &peer in self.peers.iter().filter(|&&peer| peer != self.id) {
+            self.next_index.insert(peer, next_index);
+            self.match_index.insert(peer, 0);
+        }
+
+        self.broadcast_append_entries()
     }
 
     fn start_election(&mut self, next_timeout: u64) -> Vec<Effect> {
@@ -331,9 +367,7 @@ impl Node {
         self.election_timeout = next_timeout;
 
         if self.has_quorum() {
-            self.role = Role::Leader;
-            self.heartbeat_elapsed = 0;
-            return self.send_heartbeats();
+            return self.become_leader();
         }
 
         self.peers
@@ -404,9 +438,7 @@ impl Node {
         if response.granted {
             self.votes_granted.insert(from);
             if self.has_quorum() {
-                self.role = Role::Leader;
-                self.heartbeat_elapsed = 0;
-                return self.send_heartbeats();
+                return self.become_leader();
             }
         }
 
@@ -471,10 +503,93 @@ impl Node {
         }]
     }
 
-    fn on_append_entries_response(&mut self, response: AppendEntriesResponse) {
+    fn on_append_entries_response(
+        &mut self,
+        from: NodeId,
+        response: AppendEntriesResponse,
+    ) -> Vec<Effect> {
         if response.term > self.current_term {
             self.step_down(response.term);
+            return Vec::new();
         }
+
+        if response.term < self.current_term || self.role != Role::Leader {
+            return Vec::new();
+        }
+
+        if response.success {
+            let match_index = *self
+                .match_index
+                .get(&from)
+                .expect("match_index tracked for every peer while leader");
+            let match_index = match_index.max(response.match_index);
+            self.match_index.insert(from, match_index);
+            self.next_index.insert(from, match_index + 1);
+            self.advance_commit_index();
+        } else {
+            let next_index = *self
+                .next_index
+                .get(&from)
+                .expect("next_index tracked for every peer while leader");
+            self.next_index
+                .insert(from, next_index.saturating_sub(1).max(1));
+        }
+
+        let next_index = *self
+            .next_index
+            .get(&from)
+            .expect("next_index tracked for every peer while leader");
+        if next_index <= self.last_log_index() {
+            vec![Effect::Send {
+                to: from,
+                message: Message::AppendEntries(self.append_entries_for(from)),
+            }]
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// The majority-commit rule restricted to the current term (Raft's
+    /// Figure 8 guard): a prior-term entry never commits by count alone, only
+    /// indirectly once a current-term entry at or after it does.
+    fn advance_commit_index(&mut self) {
+        let mut match_indices: Vec<u64> = self
+            .peers
+            .iter()
+            .copied()
+            .map(|peer| {
+                if peer == self.id {
+                    self.last_log_index()
+                } else {
+                    *self
+                        .match_index
+                        .get(&peer)
+                        .expect("match_index tracked for every peer while leader")
+                }
+            })
+            .collect();
+        match_indices.sort_unstable();
+
+        let candidate = match_indices[self.peers.len() - self.quorum_size()];
+        if candidate > self.commit_index && self.term_at(candidate) == Some(self.current_term) {
+            self.commit_index = candidate;
+        }
+    }
+
+    /// Appends `command` to this node's log if it is the leader, returning
+    /// the entry's new 1-based index. Replication to peers rides the existing
+    /// periodic `AppendEntries` cycle rather than sending immediately.
+    pub fn propose(&mut self, command: Vec<u8>) -> Option<u64> {
+        if self.role != Role::Leader {
+            return None;
+        }
+
+        self.log.push(LogEntry {
+            term: self.current_term,
+            command,
+        });
+        self.advance_commit_index();
+        Some(self.last_log_index())
     }
 
     fn step_down(&mut self, term: u64) {
@@ -482,6 +597,8 @@ impl Node {
         self.current_term = term;
         self.voted_for = None;
         self.votes_granted.clear();
+        self.next_index.clear();
+        self.match_index.clear();
     }
 
     fn quorum_size(&self) -> usize {
@@ -1454,5 +1571,179 @@ mod tests {
         assert_eq!(node.role(), Role::Leader);
         assert_eq!(node.election_elapsed(), 0);
         assert_eq!(node.election_timeout(), 5);
+    }
+
+    /// A 3-node leader (node 1) with an established quorum (node 2 voted for
+    /// it), ready for propose/replication tests.
+    fn established_leader() -> Node {
+        let peers = vec![NodeId(1), NodeId(2), NodeId(3)];
+        let mut node = Node::new(NodeId(1), peers, 1, 1).expect("valid node");
+        node.step(Event::Tick { next_timeout: 1 });
+        node.step(Event::Step {
+            from: NodeId(2),
+            message: Message::RequestVoteResponse(RequestVoteResponse {
+                term: 1,
+                granted: true,
+            }),
+        });
+        assert_eq!(node.role(), Role::Leader);
+        node
+    }
+
+    #[test]
+    fn propose_returns_none_when_not_leader() {
+        let peers = vec![NodeId(1), NodeId(2), NodeId(3)];
+        let mut node = Node::new(NodeId(1), peers, 5, 2).expect("valid node");
+
+        let result = node.propose(vec![1, 2, 3]);
+
+        assert_eq!(result, None);
+        assert!(node.log().is_empty());
+    }
+
+    #[test]
+    fn propose_appends_entry_and_returns_index_for_leader() {
+        let mut node = established_leader();
+
+        let index = node.propose(vec![9]);
+
+        assert_eq!(index, Some(1));
+        assert_eq!(
+            node.log(),
+            &[LogEntry {
+                term: 1,
+                command: vec![9],
+            }]
+        );
+    }
+
+    #[test]
+    fn propose_commits_immediately_in_a_single_node_cluster() {
+        let mut node = Node::new(NodeId(1), vec![NodeId(1)], 1, 1).expect("valid node");
+        node.step(Event::Tick { next_timeout: 5 });
+        assert_eq!(node.role(), Role::Leader);
+
+        let index = node.propose(vec![1]);
+
+        assert_eq!(index, Some(1));
+        assert_eq!(node.commit_index(), 1);
+    }
+
+    #[test]
+    fn on_append_entries_response_advances_match_and_next_index_on_success() {
+        let mut node = established_leader();
+        node.propose(vec![1]);
+
+        let effects = node.step(Event::Step {
+            from: NodeId(2),
+            message: Message::AppendEntriesResponse(AppendEntriesResponse {
+                term: 1,
+                success: true,
+                match_index: 1,
+            }),
+        });
+
+        assert_eq!(node.commit_index(), 1);
+        assert!(effects.is_empty());
+    }
+
+    #[test]
+    fn on_append_entries_response_backs_off_next_index_and_retries_on_failure() {
+        let mut node = established_leader();
+        node.propose(vec![1]);
+        node.propose(vec![2]);
+
+        let effects = node.step(Event::Step {
+            from: NodeId(2),
+            message: Message::AppendEntriesResponse(AppendEntriesResponse {
+                term: 1,
+                success: false,
+                match_index: 0,
+            }),
+        });
+
+        assert_eq!(
+            effects,
+            vec![Effect::Send {
+                to: NodeId(2),
+                message: Message::AppendEntries(AppendEntries {
+                    term: 1,
+                    leader_id: NodeId(1),
+                    prev_log_index: 0,
+                    prev_log_term: 0,
+                    entries: vec![
+                        LogEntry {
+                            term: 1,
+                            command: vec![1],
+                        },
+                        LogEntry {
+                            term: 1,
+                            command: vec![2],
+                        },
+                    ],
+                    leader_commit: 0,
+                }),
+            }]
+        );
+    }
+
+    #[test]
+    fn leader_does_not_commit_a_prior_term_entry_by_replica_count_alone() {
+        let mut node = established_leader();
+        node.propose(vec![1]); // entry A: term 1, index 1
+        assert_eq!(node.commit_index(), 0);
+
+        // Node 1 is deposed by a higher-term leader but keeps entry A in its
+        // log, then wins a later election itself.
+        node.step(Event::Step {
+            from: NodeId(2),
+            message: Message::AppendEntries(AppendEntries {
+                term: 2,
+                leader_id: NodeId(2),
+                prev_log_index: 1,
+                prev_log_term: 1,
+                entries: Vec::new(),
+                leader_commit: 0,
+            }),
+        });
+        assert_eq!(node.role(), Role::Follower);
+        assert_eq!(node.log().len(), 1);
+
+        node.step(Event::Tick { next_timeout: 5 });
+        assert_eq!(node.current_term(), 3);
+        node.step(Event::Step {
+            from: NodeId(2),
+            message: Message::RequestVoteResponse(RequestVoteResponse {
+                term: 3,
+                granted: true,
+            }),
+        });
+        assert_eq!(node.role(), Role::Leader);
+
+        node.propose(vec![2]); // entry B: term 3, index 2
+
+        // A majority (self + node 2) now has entry A, but not the current
+        // term's entry B. Entry A must not commit by count alone.
+        node.step(Event::Step {
+            from: NodeId(2),
+            message: Message::AppendEntriesResponse(AppendEntriesResponse {
+                term: 3,
+                success: true,
+                match_index: 1,
+            }),
+        });
+        assert_eq!(node.commit_index(), 0);
+
+        // Once a majority also has entry B, this node's own current-term
+        // entry, both entries commit together.
+        node.step(Event::Step {
+            from: NodeId(2),
+            message: Message::AppendEntriesResponse(AppendEntriesResponse {
+                term: 3,
+                success: true,
+                match_index: 2,
+            }),
+        });
+        assert_eq!(node.commit_index(), 2);
     }
 }
