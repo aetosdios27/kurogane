@@ -417,24 +417,32 @@ impl Node {
         self.election_elapsed = 0;
         self.election_timeout = next_timeout;
 
+        let mut effects = vec![Effect::PersistHardState {
+            term: self.current_term,
+            voted_for: self.voted_for,
+        }];
+
         if self.has_quorum() {
-            return self.become_leader();
+            effects.extend(self.become_leader());
+            return effects;
         }
 
-        self.peers
-            .iter()
-            .copied()
-            .filter(|&peer| peer != self.id)
-            .map(|peer| Effect::Send {
-                to: peer,
-                message: Message::RequestVote(RequestVote {
-                    term: self.current_term,
-                    candidate_id: self.id,
-                    last_log_index: self.last_log_index(),
-                    last_log_term: self.last_log_term(),
+        effects.extend(
+            self.peers
+                .iter()
+                .copied()
+                .filter(|&peer| peer != self.id)
+                .map(|peer| Effect::Send {
+                    to: peer,
+                    message: Message::RequestVote(RequestVote {
+                        term: self.current_term,
+                        candidate_id: self.id,
+                        last_log_index: self.last_log_index(),
+                        last_log_term: self.last_log_term(),
+                    }),
                 }),
-            })
-            .collect()
+        );
+        effects
     }
 
     fn on_request_vote(&mut self, from: NodeId, request: RequestVote) -> Vec<Effect> {
@@ -448,7 +456,8 @@ impl Node {
             }];
         }
 
-        if request.term > self.current_term {
+        let stepped_down = request.term > self.current_term;
+        if stepped_down {
             self.step_down(request.term);
         }
 
@@ -463,13 +472,24 @@ impl Node {
             self.election_elapsed = 0;
         }
 
-        vec![Effect::Send {
+        let mut effects = Vec::new();
+        // Persist whenever term or vote changed, even on a rejection: a
+        // step-down that clears the prior vote must survive a crash just as
+        // much as a granted one does.
+        if stepped_down || can_grant {
+            effects.push(Effect::PersistHardState {
+                term: self.current_term,
+                voted_for: self.voted_for,
+            });
+        }
+        effects.push(Effect::Send {
             to: from,
             message: Message::RequestVoteResponse(RequestVoteResponse {
                 term: self.current_term,
                 granted: can_grant,
             }),
-        }]
+        });
+        effects
     }
 
     fn on_request_vote_response(
@@ -479,7 +499,10 @@ impl Node {
     ) -> Vec<Effect> {
         if response.term > self.current_term {
             self.step_down(response.term);
-            return Vec::new();
+            return vec![Effect::PersistHardState {
+                term: self.current_term,
+                voted_for: self.voted_for,
+            }];
         }
 
         if response.term < self.current_term || self.role != Role::Candidate {
@@ -512,7 +535,8 @@ impl Node {
             return vec![self.reject_append_entries(from)];
         }
 
-        if request.term > self.current_term {
+        let stepped_down = request.term > self.current_term;
+        if stepped_down {
             self.step_down(request.term);
         } else if self.role == Role::Candidate {
             self.role = Role::Follower;
@@ -523,10 +547,21 @@ impl Node {
         if request.prev_log_index > 0 {
             match self.term_at(request.prev_log_index) {
                 Some(term) if term == request.prev_log_term => {}
-                _ => return vec![self.reject_append_entries(from)],
+                _ => {
+                    let mut effects = Vec::new();
+                    if stepped_down {
+                        effects.push(Effect::PersistHardState {
+                            term: self.current_term,
+                            voted_for: self.voted_for,
+                        });
+                    }
+                    effects.push(self.reject_append_entries(from));
+                    return effects;
+                }
             }
         }
 
+        let mut log_changed_from: Option<u64> = None;
         for (offset, entry) in request.entries.iter().enumerate() {
             let index = request.prev_log_index + offset as u64 + 1;
             match self.term_at(index) {
@@ -534,8 +569,16 @@ impl Node {
                 Some(_) => {
                     self.log.truncate((index - 1) as usize);
                     self.log.push(entry.clone());
+                    if log_changed_from.is_none() {
+                        log_changed_from = Some(index);
+                    }
                 }
-                None => self.log.push(entry.clone()),
+                None => {
+                    self.log.push(entry.clone());
+                    if log_changed_from.is_none() {
+                        log_changed_from = Some(index);
+                    }
+                }
             }
         }
 
@@ -544,14 +587,29 @@ impl Node {
         }
 
         let match_index = request.prev_log_index + request.entries.len() as u64;
-        vec![Effect::Send {
+
+        let mut effects = Vec::new();
+        if stepped_down {
+            effects.push(Effect::PersistHardState {
+                term: self.current_term,
+                voted_for: self.voted_for,
+            });
+        }
+        if let Some(from_index) = log_changed_from {
+            effects.push(Effect::PersistLog {
+                from_index,
+                entries: self.log[(from_index - 1) as usize..].to_vec(),
+            });
+        }
+        effects.push(Effect::Send {
             to: from,
             message: Message::AppendEntriesResponse(AppendEntriesResponse {
                 term: self.current_term,
                 success: true,
                 match_index,
             }),
-        }]
+        });
+        effects
     }
 
     fn on_append_entries_response(
@@ -561,7 +619,10 @@ impl Node {
     ) -> Vec<Effect> {
         if response.term > self.current_term {
             self.step_down(response.term);
-            return Vec::new();
+            return vec![Effect::PersistHardState {
+                term: self.current_term,
+                voted_for: self.voted_for,
+            }];
         }
 
         if response.term < self.current_term || self.role != Role::Leader {
@@ -628,19 +689,29 @@ impl Node {
     }
 
     /// Appends `command` to this node's log if it is the leader, returning
-    /// the entry's new 1-based index. Replication to peers rides the existing
-    /// periodic `AppendEntries` cycle rather than sending immediately.
-    pub fn propose(&mut self, command: Vec<u8>) -> Option<u64> {
+    /// the entry's new 1-based index and the `Effect`s needed to make it
+    /// durable. Replication to peers rides the existing periodic
+    /// `AppendEntries` cycle rather than sending immediately.
+    pub fn propose(&mut self, command: Vec<u8>) -> Option<(u64, Vec<Effect>)> {
         if self.role != Role::Leader {
             return None;
         }
 
-        self.log.push(LogEntry {
+        let entry = LogEntry {
             term: self.current_term,
             command,
-        });
+        };
+        self.log.push(entry.clone());
+        let index = self.last_log_index();
         self.advance_commit_index();
-        Some(self.last_log_index())
+
+        Some((
+            index,
+            vec![Effect::PersistLog {
+                from_index: index,
+                entries: vec![entry],
+            }],
+        ))
     }
 
     fn step_down(&mut self, term: u64) {
@@ -796,6 +867,10 @@ mod tests {
         assert_eq!(
             effects,
             vec![
+                Effect::PersistHardState {
+                    term: 1,
+                    voted_for: Some(NodeId(1)),
+                },
                 Effect::Send {
                     to: NodeId(2),
                     message: Message::RequestVote(expected_request),
@@ -814,7 +889,13 @@ mod tests {
 
         let effects = node.step(Event::Tick { next_timeout: 5 });
 
-        assert!(effects.is_empty());
+        assert_eq!(
+            effects,
+            vec![Effect::PersistHardState {
+                term: 1,
+                voted_for: Some(NodeId(1)),
+            }]
+        );
         assert_eq!(node.role(), Role::Leader);
         assert_eq!(node.current_term(), 1);
         assert_eq!(node.heartbeat_elapsed(), 0);
@@ -841,13 +922,19 @@ mod tests {
         assert_eq!(node.current_term(), 1);
         assert_eq!(
             effects,
-            vec![Effect::Send {
-                to: NodeId(2),
-                message: Message::RequestVoteResponse(RequestVoteResponse {
+            vec![
+                Effect::PersistHardState {
                     term: 1,
-                    granted: true,
-                }),
-            }]
+                    voted_for: Some(NodeId(2)),
+                },
+                Effect::Send {
+                    to: NodeId(2),
+                    message: Message::RequestVoteResponse(RequestVoteResponse {
+                        term: 1,
+                        granted: true,
+                    }),
+                }
+            ]
         );
     }
 
@@ -948,13 +1035,19 @@ mod tests {
         assert_eq!(node.voted_for(), Some(NodeId(3)));
         assert_eq!(
             effects,
-            vec![Effect::Send {
-                to: NodeId(3),
-                message: Message::RequestVoteResponse(RequestVoteResponse {
+            vec![
+                Effect::PersistHardState {
                     term: 2,
-                    granted: true,
-                }),
-            }]
+                    voted_for: Some(NodeId(3)),
+                },
+                Effect::Send {
+                    to: NodeId(3),
+                    message: Message::RequestVoteResponse(RequestVoteResponse {
+                        term: 2,
+                        granted: true,
+                    }),
+                }
+            ]
         );
     }
 
@@ -1073,14 +1166,20 @@ mod tests {
         assert_eq!(node.election_elapsed(), 0);
         assert_eq!(
             effects,
-            vec![Effect::Send {
-                to: NodeId(2),
-                message: Message::AppendEntriesResponse(AppendEntriesResponse {
+            vec![
+                Effect::PersistHardState {
                     term: 1,
-                    success: true,
-                    match_index: 0,
-                }),
-            }]
+                    voted_for: None,
+                },
+                Effect::Send {
+                    to: NodeId(2),
+                    message: Message::AppendEntriesResponse(AppendEntriesResponse {
+                        term: 1,
+                        success: true,
+                        match_index: 0,
+                    }),
+                }
+            ]
         );
     }
 
@@ -1173,14 +1272,20 @@ mod tests {
         assert!(node.log().is_empty());
         assert_eq!(
             effects,
-            vec![Effect::Send {
-                to: NodeId(2),
-                message: Message::AppendEntriesResponse(AppendEntriesResponse {
+            vec![
+                Effect::PersistHardState {
                     term: 1,
-                    success: false,
-                    match_index: 0,
-                }),
-            }]
+                    voted_for: None,
+                },
+                Effect::Send {
+                    to: NodeId(2),
+                    message: Message::AppendEntriesResponse(AppendEntriesResponse {
+                        term: 1,
+                        success: false,
+                        match_index: 0,
+                    }),
+                }
+            ]
         );
     }
 
@@ -1216,14 +1321,24 @@ mod tests {
         assert_eq!(node.last_log_term(), 1);
         assert_eq!(
             effects,
-            vec![Effect::Send {
-                to: NodeId(2),
-                message: Message::AppendEntriesResponse(AppendEntriesResponse {
+            vec![
+                Effect::PersistHardState {
                     term: 1,
-                    success: true,
-                    match_index: 2,
-                }),
-            }]
+                    voted_for: None,
+                },
+                Effect::PersistLog {
+                    from_index: 1,
+                    entries: entries.clone(),
+                },
+                Effect::Send {
+                    to: NodeId(2),
+                    message: Message::AppendEntriesResponse(AppendEntriesResponse {
+                        term: 1,
+                        success: true,
+                        match_index: 2,
+                    }),
+                }
+            ]
         );
     }
 
@@ -1273,14 +1388,24 @@ mod tests {
         assert_eq!(node.log()[1], replacement);
         assert_eq!(
             effects,
-            vec![Effect::Send {
-                to: NodeId(2),
-                message: Message::AppendEntriesResponse(AppendEntriesResponse {
+            vec![
+                Effect::PersistHardState {
                     term: 2,
-                    success: true,
-                    match_index: 2,
-                }),
-            }]
+                    voted_for: None,
+                },
+                Effect::PersistLog {
+                    from_index: 2,
+                    entries: vec![replacement],
+                },
+                Effect::Send {
+                    to: NodeId(2),
+                    message: Message::AppendEntriesResponse(AppendEntriesResponse {
+                        term: 2,
+                        success: true,
+                        match_index: 2,
+                    }),
+                }
+            ]
         );
     }
 
@@ -1345,7 +1470,27 @@ mod tests {
         });
 
         assert_eq!(node.log().len(), 1);
-        assert_eq!(first, second);
+
+        // The two deliveries are not effect-for-effect identical: the first
+        // legitimately persists (new term, a new entry); the second changes
+        // nothing and persists nothing. What "idempotent" means here is that
+        // the response is the same either way, not that the two calls do
+        // identical work.
+        let response = |effects: &[Effect]| {
+            effects.iter().find_map(|effect| match effect {
+                Effect::Send { message, .. } => Some(message.clone()),
+                _ => None,
+            })
+        };
+        assert_eq!(response(&first), response(&second));
+        assert_eq!(
+            response(&second),
+            Some(Message::AppendEntriesResponse(AppendEntriesResponse {
+                term: 1,
+                success: true,
+                match_index: 1,
+            }))
+        );
     }
 
     #[test]
@@ -1379,14 +1524,20 @@ mod tests {
         assert_eq!(node.voted_for(), None);
         assert_eq!(
             effects,
-            vec![Effect::Send {
-                to: NodeId(3),
-                message: Message::AppendEntriesResponse(AppendEntriesResponse {
+            vec![
+                Effect::PersistHardState {
                     term: 2,
-                    success: true,
-                    match_index: 0,
-                }),
-            }]
+                    voted_for: None,
+                },
+                Effect::Send {
+                    to: NodeId(3),
+                    message: Message::AppendEntriesResponse(AppendEntriesResponse {
+                        term: 2,
+                        success: true,
+                        match_index: 0,
+                    }),
+                }
+            ]
         );
     }
 
@@ -1413,7 +1564,13 @@ mod tests {
             }),
         });
 
-        assert!(effects.is_empty());
+        assert_eq!(
+            effects,
+            vec![Effect::PersistHardState {
+                term: 4,
+                voted_for: None,
+            }]
+        );
         assert_eq!(node.role(), Role::Follower);
         assert_eq!(node.current_term(), 4);
         assert_eq!(node.voted_for(), None);
@@ -1479,13 +1636,19 @@ mod tests {
         assert_eq!(node.voted_for(), Some(NodeId(2)));
         assert_eq!(
             effects,
-            vec![Effect::Send {
-                to: NodeId(2),
-                message: Message::RequestVoteResponse(RequestVoteResponse {
+            vec![
+                Effect::PersistHardState {
                     term: 1,
-                    granted: true,
-                }),
-            }]
+                    voted_for: Some(NodeId(2)),
+                },
+                Effect::Send {
+                    to: NodeId(2),
+                    message: Message::RequestVoteResponse(RequestVoteResponse {
+                        term: 1,
+                        granted: true,
+                    }),
+                }
+            ]
         );
     }
 
@@ -1529,13 +1692,22 @@ mod tests {
         assert_eq!(node.voted_for(), None);
         assert_eq!(
             effects,
-            vec![Effect::Send {
-                to: NodeId(2),
-                message: Message::RequestVoteResponse(RequestVoteResponse {
+            vec![
+                // The step-down cleared the term-3 vote; that must persist
+                // even though this candidate's stale log means no new vote
+                // is granted.
+                Effect::PersistHardState {
                     term: 9,
-                    granted: false,
-                }),
-            }]
+                    voted_for: None,
+                },
+                Effect::Send {
+                    to: NodeId(2),
+                    message: Message::RequestVoteResponse(RequestVoteResponse {
+                        term: 9,
+                        granted: false,
+                    }),
+                }
+            ]
         );
     }
 
@@ -1553,7 +1725,13 @@ mod tests {
             }),
         });
 
-        assert!(effects.is_empty());
+        assert_eq!(
+            effects,
+            vec![Effect::PersistHardState {
+                term: 5,
+                voted_for: None,
+            }]
+        );
         assert_eq!(node.role(), Role::Follower);
         assert_eq!(node.current_term(), 5);
         assert_eq!(node.voted_for(), None);
@@ -1688,9 +1866,19 @@ mod tests {
     fn propose_appends_entry_and_returns_index_for_leader() {
         let mut node = established_leader();
 
-        let index = node.propose(vec![9]);
+        let (index, effects) = node.propose(vec![9]).expect("leader accepts propose");
 
-        assert_eq!(index, Some(1));
+        assert_eq!(index, 1);
+        assert_eq!(
+            effects,
+            vec![Effect::PersistLog {
+                from_index: 1,
+                entries: vec![LogEntry {
+                    term: 1,
+                    command: vec![9],
+                }],
+            }]
+        );
         assert_eq!(
             node.log(),
             &[LogEntry {
@@ -1706,9 +1894,9 @@ mod tests {
         node.step(Event::Tick { next_timeout: 5 });
         assert_eq!(node.role(), Role::Leader);
 
-        let index = node.propose(vec![1]);
+        let (index, _effects) = node.propose(vec![1]).expect("leader accepts propose");
 
-        assert_eq!(index, Some(1));
+        assert_eq!(index, 1);
         assert_eq!(node.commit_index(), 1);
     }
 

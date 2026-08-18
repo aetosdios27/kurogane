@@ -212,12 +212,13 @@ impl Replica {
     }
 
     /// Proposes `command` if this replica's node is the leader, returning
-    /// its log index. Never returns the eventual result -- the entry may
-    /// not even commit -- that arrives later through `applied_result`.
-    pub fn propose(&mut self, command: Command) -> Option<u64> {
-        let index = self.node.propose(command.encode())?;
+    /// its log index and the effects needed to make it durable. Never
+    /// returns the eventual result -- the entry may not even commit --
+    /// that arrives later through `applied_result`.
+    pub fn propose(&mut self, command: Command) -> Option<(u64, Vec<Effect>)> {
+        let (index, effects) = self.node.propose(command.encode())?;
         self.drain_committed();
-        Some(index)
+        Some((index, effects))
     }
 
     pub fn step(&mut self, event: Event) -> Vec<Effect> {
@@ -418,7 +419,7 @@ mod tests {
         replica.step(Event::Tick { next_timeout: 5 });
         assert_eq!(replica.node().role(), Role::Leader);
 
-        let index = replica
+        let (index, _effects) = replica
             .propose(Command::Set {
                 key: vec![1],
                 value: vec![9],
@@ -637,7 +638,7 @@ mod tests {
             key: vec![1],
             value: vec![42],
         });
-        let get_index = leader
+        let (get_index, _effects) = leader
             .propose(Command::Get { key: vec![1] })
             .expect("leader accepts propose");
 

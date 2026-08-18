@@ -586,14 +586,20 @@ mod simulation_tests {
         );
         assert_eq!(
             effects,
-            vec![Effect::Send {
-                to: NodeId(2),
-                message: Message::AppendEntriesResponse(AppendEntriesResponse {
+            vec![
+                Effect::PersistHardState {
                     term: 2,
-                    success: true,
-                    match_index: 0,
-                }),
-            }]
+                    voted_for: None,
+                },
+                Effect::Send {
+                    to: NodeId(2),
+                    message: Message::AppendEntriesResponse(AppendEntriesResponse {
+                        term: 2,
+                        success: true,
+                        match_index: 0,
+                    }),
+                }
+            ]
         );
     }
 
