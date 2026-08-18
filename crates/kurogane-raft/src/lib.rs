@@ -150,11 +150,140 @@ impl Node {
     pub fn votes_granted(&self) -> &BTreeSet<NodeId> {
         &self.votes_granted
     }
+
+    /// Applies one explicit input to this node's protocol state, returning the
+    /// effects its owner must interpret (e.g. sending a message to a peer).
+    pub fn step(&mut self, event: Event) -> Vec<Effect> {
+        match event {
+            Event::Tick { next_timeout } => self.on_tick(next_timeout),
+            Event::Step { from, message } => match message {
+                Message::RequestVote(request) => self.on_request_vote(from, request),
+                Message::RequestVoteResponse(response) => {
+                    self.on_request_vote_response(from, response);
+                    Vec::new()
+                }
+            },
+        }
+    }
+
+    fn on_tick(&mut self, next_timeout: u64) -> Vec<Effect> {
+        if self.role == Role::Leader {
+            return Vec::new();
+        }
+
+        self.election_elapsed += 1;
+        if self.election_elapsed < self.election_timeout {
+            return Vec::new();
+        }
+
+        self.start_election(next_timeout)
+    }
+
+    fn start_election(&mut self, next_timeout: u64) -> Vec<Effect> {
+        self.role = Role::Candidate;
+        self.current_term += 1;
+        self.voted_for = Some(self.id);
+        self.votes_granted.clear();
+        self.votes_granted.insert(self.id);
+        self.election_elapsed = 0;
+        self.election_timeout = next_timeout;
+
+        if self.has_quorum() {
+            self.role = Role::Leader;
+            return Vec::new();
+        }
+
+        self.peers
+            .iter()
+            .copied()
+            .filter(|&peer| peer != self.id)
+            .map(|peer| Effect::Send {
+                to: peer,
+                message: Message::RequestVote(RequestVote {
+                    term: self.current_term,
+                    candidate_id: self.id,
+                    last_log_index: 0,
+                    last_log_term: 0,
+                }),
+            })
+            .collect()
+    }
+
+    fn on_request_vote(&mut self, from: NodeId, request: RequestVote) -> Vec<Effect> {
+        if request.term < self.current_term {
+            return vec![Effect::Send {
+                to: from,
+                message: Message::RequestVoteResponse(RequestVoteResponse {
+                    term: self.current_term,
+                    granted: false,
+                }),
+            }];
+        }
+
+        if request.term > self.current_term {
+            self.step_down(request.term);
+        }
+
+        let can_grant = match self.voted_for {
+            None => true,
+            Some(voted_for) => voted_for == request.candidate_id,
+        };
+
+        if can_grant {
+            self.voted_for = Some(request.candidate_id);
+            self.election_elapsed = 0;
+        }
+
+        vec![Effect::Send {
+            to: from,
+            message: Message::RequestVoteResponse(RequestVoteResponse {
+                term: self.current_term,
+                granted: can_grant,
+            }),
+        }]
+    }
+
+    fn on_request_vote_response(&mut self, from: NodeId, response: RequestVoteResponse) {
+        if response.term > self.current_term {
+            self.step_down(response.term);
+            return;
+        }
+
+        if response.term < self.current_term || self.role != Role::Candidate {
+            return;
+        }
+
+        if response.granted {
+            self.votes_granted.insert(from);
+            if self.has_quorum() {
+                self.role = Role::Leader;
+            }
+        }
+    }
+
+    fn step_down(&mut self, term: u64) {
+        self.role = Role::Follower;
+        self.current_term = term;
+        self.voted_for = None;
+        self.votes_granted.clear();
+    }
+
+    fn quorum_size(&self) -> usize {
+        self.peers.len() / 2 + 1
+    }
+
+    fn has_quorum(&self) -> bool {
+        self.votes_granted.len() >= self.quorum_size()
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{ConfigError, Node, NodeId, Role};
+    use std::collections::BTreeSet;
+
+    use super::{
+        ConfigError, Effect, Event, Message, Node, NodeId, RequestVote, RequestVoteResponse, Role,
+    };
 
     #[test]
     fn constructs_initial_follower_state() {
@@ -199,5 +328,281 @@ mod tests {
         for (result, expected) in cases {
             assert_eq!(result.expect_err("configuration must fail"), expected);
         }
+    }
+
+    #[test]
+    fn tick_below_timeout_produces_no_effects() {
+        let peers = vec![NodeId(1), NodeId(2), NodeId(3)];
+        let mut node = Node::new(NodeId(1), peers, 3).expect("valid node");
+
+        let effects = node.step(Event::Tick { next_timeout: 5 });
+
+        assert!(effects.is_empty());
+        assert_eq!(node.role(), Role::Follower);
+        assert_eq!(node.election_elapsed(), 1);
+    }
+
+    #[test]
+    fn tick_at_timeout_starts_election_and_requests_votes_from_peers() {
+        let peers = vec![NodeId(1), NodeId(2), NodeId(3)];
+        let mut node = Node::new(NodeId(1), peers, 1).expect("valid node");
+
+        let effects = node.step(Event::Tick { next_timeout: 7 });
+
+        assert_eq!(node.role(), Role::Candidate);
+        assert_eq!(node.current_term(), 1);
+        assert_eq!(node.voted_for(), Some(NodeId(1)));
+        assert_eq!(node.election_elapsed(), 0);
+        assert_eq!(node.election_timeout(), 7);
+        assert_eq!(node.votes_granted(), &BTreeSet::from([NodeId(1)]));
+
+        let expected_request = RequestVote {
+            term: 1,
+            candidate_id: NodeId(1),
+            last_log_index: 0,
+            last_log_term: 0,
+        };
+        assert_eq!(
+            effects,
+            vec![
+                Effect::Send {
+                    to: NodeId(2),
+                    message: Message::RequestVote(expected_request),
+                },
+                Effect::Send {
+                    to: NodeId(3),
+                    message: Message::RequestVote(expected_request),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn single_node_cluster_wins_election_immediately() {
+        let mut node = Node::new(NodeId(1), vec![NodeId(1)], 1).expect("valid node");
+
+        let effects = node.step(Event::Tick { next_timeout: 5 });
+
+        assert!(effects.is_empty());
+        assert_eq!(node.role(), Role::Leader);
+        assert_eq!(node.current_term(), 1);
+    }
+
+    #[test]
+    fn grants_vote_and_resets_election_elapsed() {
+        let peers = vec![NodeId(1), NodeId(2), NodeId(3)];
+        let mut node = Node::new(NodeId(1), peers, 5).expect("valid node");
+        node.step(Event::Tick { next_timeout: 5 });
+
+        let effects = node.step(Event::Step {
+            from: NodeId(2),
+            message: Message::RequestVote(RequestVote {
+                term: 1,
+                candidate_id: NodeId(2),
+                last_log_index: 0,
+                last_log_term: 0,
+            }),
+        });
+
+        assert_eq!(node.voted_for(), Some(NodeId(2)));
+        assert_eq!(node.election_elapsed(), 0);
+        assert_eq!(node.current_term(), 1);
+        assert_eq!(
+            effects,
+            vec![Effect::Send {
+                to: NodeId(2),
+                message: Message::RequestVoteResponse(RequestVoteResponse {
+                    term: 1,
+                    granted: true,
+                }),
+            }]
+        );
+    }
+
+    #[test]
+    fn rejects_vote_when_already_voted_for_different_candidate() {
+        let peers = vec![NodeId(1), NodeId(2), NodeId(3)];
+        let mut node = Node::new(NodeId(1), peers, 5).expect("valid node");
+        node.step(Event::Step {
+            from: NodeId(2),
+            message: Message::RequestVote(RequestVote {
+                term: 1,
+                candidate_id: NodeId(2),
+                last_log_index: 0,
+                last_log_term: 0,
+            }),
+        });
+
+        let effects = node.step(Event::Step {
+            from: NodeId(3),
+            message: Message::RequestVote(RequestVote {
+                term: 1,
+                candidate_id: NodeId(3),
+                last_log_index: 0,
+                last_log_term: 0,
+            }),
+        });
+
+        assert_eq!(node.voted_for(), Some(NodeId(2)));
+        assert_eq!(
+            effects,
+            vec![Effect::Send {
+                to: NodeId(3),
+                message: Message::RequestVoteResponse(RequestVoteResponse {
+                    term: 1,
+                    granted: false,
+                }),
+            }]
+        );
+    }
+
+    #[test]
+    fn rejects_request_vote_with_stale_term() {
+        let peers = vec![NodeId(1), NodeId(2), NodeId(3)];
+        let mut node = Node::new(NodeId(1), peers, 1).expect("valid node");
+        node.step(Event::Tick { next_timeout: 5 });
+
+        let effects = node.step(Event::Step {
+            from: NodeId(2),
+            message: Message::RequestVote(RequestVote {
+                term: 0,
+                candidate_id: NodeId(2),
+                last_log_index: 0,
+                last_log_term: 0,
+            }),
+        });
+
+        assert_eq!(node.role(), Role::Candidate);
+        assert_eq!(node.current_term(), 1);
+        assert_eq!(node.voted_for(), Some(NodeId(1)));
+        assert_eq!(
+            effects,
+            vec![Effect::Send {
+                to: NodeId(2),
+                message: Message::RequestVoteResponse(RequestVoteResponse {
+                    term: 1,
+                    granted: false,
+                }),
+            }]
+        );
+    }
+
+    #[test]
+    fn steps_down_and_grants_vote_on_higher_term_request_vote() {
+        let peers = vec![NodeId(1), NodeId(2), NodeId(3)];
+        let mut node = Node::new(NodeId(1), peers, 1).expect("valid node");
+        node.step(Event::Tick { next_timeout: 5 });
+        node.step(Event::Step {
+            from: NodeId(2),
+            message: Message::RequestVoteResponse(RequestVoteResponse {
+                term: 1,
+                granted: true,
+            }),
+        });
+        assert_eq!(node.role(), Role::Leader);
+
+        let effects = node.step(Event::Step {
+            from: NodeId(3),
+            message: Message::RequestVote(RequestVote {
+                term: 2,
+                candidate_id: NodeId(3),
+                last_log_index: 0,
+                last_log_term: 0,
+            }),
+        });
+
+        assert_eq!(node.role(), Role::Follower);
+        assert_eq!(node.current_term(), 2);
+        assert_eq!(node.voted_for(), Some(NodeId(3)));
+        assert_eq!(
+            effects,
+            vec![Effect::Send {
+                to: NodeId(3),
+                message: Message::RequestVoteResponse(RequestVoteResponse {
+                    term: 2,
+                    granted: true,
+                }),
+            }]
+        );
+    }
+
+    #[test]
+    fn becomes_leader_once_quorum_of_votes_is_granted() {
+        let peers = vec![NodeId(1), NodeId(2), NodeId(3)];
+        let mut node = Node::new(NodeId(1), peers, 1).expect("valid node");
+        node.step(Event::Tick { next_timeout: 5 });
+        assert_eq!(node.role(), Role::Candidate);
+
+        let effects = node.step(Event::Step {
+            from: NodeId(2),
+            message: Message::RequestVoteResponse(RequestVoteResponse {
+                term: 1,
+                granted: true,
+            }),
+        });
+
+        assert!(effects.is_empty());
+        assert_eq!(node.role(), Role::Leader);
+        assert_eq!(
+            node.votes_granted(),
+            &BTreeSet::from([NodeId(1), NodeId(2)])
+        );
+    }
+
+    #[test]
+    fn steps_down_on_higher_term_vote_response() {
+        let peers = vec![NodeId(1), NodeId(2), NodeId(3)];
+        let mut node = Node::new(NodeId(1), peers, 1).expect("valid node");
+        node.step(Event::Tick { next_timeout: 5 });
+
+        let effects = node.step(Event::Step {
+            from: NodeId(2),
+            message: Message::RequestVoteResponse(RequestVoteResponse {
+                term: 5,
+                granted: false,
+            }),
+        });
+
+        assert!(effects.is_empty());
+        assert_eq!(node.role(), Role::Follower);
+        assert_eq!(node.current_term(), 5);
+        assert_eq!(node.voted_for(), None);
+        assert!(node.votes_granted().is_empty());
+    }
+
+    #[test]
+    fn ignores_stale_term_vote_response() {
+        let peers = vec![NodeId(1), NodeId(2), NodeId(3)];
+        let mut node = Node::new(NodeId(1), peers, 1).expect("valid node");
+        node.step(Event::Tick { next_timeout: 1 });
+        node.step(Event::Tick { next_timeout: 1 });
+        assert_eq!(node.current_term(), 2);
+
+        let effects = node.step(Event::Step {
+            from: NodeId(2),
+            message: Message::RequestVoteResponse(RequestVoteResponse {
+                term: 1,
+                granted: true,
+            }),
+        });
+
+        assert!(effects.is_empty());
+        assert_eq!(node.role(), Role::Candidate);
+        assert_eq!(node.current_term(), 2);
+        assert_eq!(node.votes_granted(), &BTreeSet::from([NodeId(1)]));
+    }
+
+    #[test]
+    fn leader_ignores_tick_events() {
+        let mut node = Node::new(NodeId(1), vec![NodeId(1)], 1).expect("valid node");
+        node.step(Event::Tick { next_timeout: 5 });
+        assert_eq!(node.role(), Role::Leader);
+
+        let effects = node.step(Event::Tick { next_timeout: 9 });
+
+        assert!(effects.is_empty());
+        assert_eq!(node.role(), Role::Leader);
+        assert_eq!(node.election_elapsed(), 0);
+        assert_eq!(node.election_timeout(), 5);
     }
 }
