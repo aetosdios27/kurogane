@@ -379,6 +379,46 @@ mod simulation_tests {
         panic!("cluster failed to elect a leader within {max_ticks} ticks");
     }
 
+    /// Delivers `effects` (sent by `from`) to their targets over an
+    /// instantaneous, fully-connected network, then recursively delivers
+    /// whatever those deliveries produce, until nothing remains in flight.
+    /// Node IDs in `isolated` never receive anything, simulating a partition.
+    /// For hand-driven scenarios that don't need `Simulation`'s timing model.
+    fn deliver_until_quiescent(
+        cluster: &mut Cluster,
+        isolated: &[NodeId],
+        from: NodeId,
+        effects: Vec<Effect>,
+    ) {
+        let mut pending: Vec<(NodeId, NodeId, Message)> = effects
+            .into_iter()
+            .filter(|Effect::Send { to, .. }| !isolated.contains(to))
+            .map(|Effect::Send { to, message }| (from, to, message))
+            .collect();
+
+        let mut guard = 0;
+        while let Some((from, to, message)) = pending.pop() {
+            guard += 1;
+            assert!(guard < 10_000, "deliver_until_quiescent did not converge");
+
+            let response = cluster
+                .node_mut(to)
+                .expect("known node")
+                .step(Event::Step { from, message });
+            pending.extend(
+                response
+                    .into_iter()
+                    .filter(|Effect::Send { to, .. }| !isolated.contains(to))
+                    .map(
+                        |Effect::Send {
+                             to: respond_to,
+                             message,
+                         }| (to, respond_to, message),
+                    ),
+            );
+        }
+    }
+
     #[test]
     fn elects_a_single_leader_and_never_two_in_the_same_term() {
         let mut simulation = Simulation::new(three_node_cluster(3, 1), 42, 3, 6, 1, 2);
@@ -704,6 +744,183 @@ mod simulation_tests {
                     granted: false,
                 }),
             }]
+        );
+    }
+
+    #[test]
+    fn a_follower_that_missed_early_replication_catches_up_on_the_next_heartbeat() {
+        let peers = [NodeId(1), NodeId(2), NodeId(3)];
+        let mut cluster = Cluster::new(
+            peers
+                .iter()
+                .map(|&id| Node::new(id, peers.to_vec(), 1, 1).expect("valid node"))
+                .collect(),
+        )
+        .expect("valid cluster");
+
+        let requests = cluster
+            .node_mut(NodeId(1))
+            .expect("known node")
+            .step(Event::Tick { next_timeout: 10 });
+        deliver_until_quiescent(&mut cluster, &[], NodeId(1), requests);
+        assert_eq!(
+            cluster.node(NodeId(1)).expect("known node").role(),
+            Role::Leader
+        );
+
+        for command in [vec![1u8], vec![2], vec![3]] {
+            cluster
+                .node_mut(NodeId(1))
+                .expect("known node")
+                .propose(command);
+        }
+        assert_eq!(
+            cluster
+                .node(NodeId(3))
+                .expect("known node")
+                .last_log_index(),
+            0
+        );
+
+        let heartbeat = cluster
+            .node_mut(NodeId(1))
+            .expect("known node")
+            .step(Event::Tick { next_timeout: 10 });
+        deliver_until_quiescent(&mut cluster, &[], NodeId(1), heartbeat);
+
+        let leaders_log = cluster.node(NodeId(1)).expect("known node").log().to_vec();
+        assert_eq!(
+            cluster.node(NodeId(3)).expect("known node").log(),
+            leaders_log.as_slice()
+        );
+        assert_eq!(
+            cluster.node(NodeId(1)).expect("known node").commit_index(),
+            3
+        );
+    }
+
+    #[test]
+    fn leader_replacement_preserves_committed_entries_and_converges_diverged_logs() {
+        let peers = [NodeId(1), NodeId(2), NodeId(3)];
+        let mut cluster = Cluster::new(
+            peers
+                .iter()
+                .map(|&id| Node::new(id, peers.to_vec(), 1, 1).expect("valid node"))
+                .collect(),
+        )
+        .expect("valid cluster");
+
+        // Node 1 wins term 1 uncontested and commits entry A on the full
+        // cluster.
+        let requests = cluster
+            .node_mut(NodeId(1))
+            .expect("known node")
+            .step(Event::Tick { next_timeout: 10 });
+        deliver_until_quiescent(&mut cluster, &[], NodeId(1), requests);
+        assert_eq!(
+            cluster.node(NodeId(1)).expect("known node").role(),
+            Role::Leader
+        );
+
+        cluster
+            .node_mut(NodeId(1))
+            .expect("known node")
+            .propose(vec![b'A']);
+        let heartbeat = cluster
+            .node_mut(NodeId(1))
+            .expect("known node")
+            .step(Event::Tick { next_timeout: 10 });
+        deliver_until_quiescent(&mut cluster, &[], NodeId(1), heartbeat);
+        assert_eq!(
+            cluster.node(NodeId(1)).expect("known node").commit_index(),
+            1
+        );
+
+        // Node 1 proposes one more entry that never leaves its own log, then
+        // is isolated before it can replicate.
+        cluster
+            .node_mut(NodeId(1))
+            .expect("known node")
+            .propose(vec![b'C']);
+        assert_eq!(
+            cluster
+                .node(NodeId(1))
+                .expect("known node")
+                .last_log_index(),
+            2
+        );
+
+        // Node 2 times out (node 1 never contacts it again) and wins term 2
+        // with node 3's vote.
+        let node2_requests = cluster
+            .node_mut(NodeId(2))
+            .expect("known node")
+            .step(Event::Tick { next_timeout: 10 });
+        deliver_until_quiescent(&mut cluster, &[NodeId(1)], NodeId(2), node2_requests);
+        assert_eq!(
+            cluster.node(NodeId(2)).expect("known node").role(),
+            Role::Leader
+        );
+        assert_eq!(
+            cluster.node(NodeId(2)).expect("known node").current_term(),
+            2
+        );
+
+        // Node 2 proposes and commits entry B on the majority that can hear
+        // it.
+        cluster
+            .node_mut(NodeId(2))
+            .expect("known node")
+            .propose(vec![b'B']);
+        let node2_heartbeat = cluster
+            .node_mut(NodeId(2))
+            .expect("known node")
+            .step(Event::Tick { next_timeout: 10 });
+        deliver_until_quiescent(&mut cluster, &[NodeId(1)], NodeId(2), node2_heartbeat);
+        assert_eq!(
+            cluster.node(NodeId(2)).expect("known node").commit_index(),
+            2
+        );
+        assert_eq!(
+            cluster
+                .node(NodeId(3))
+                .expect("known node")
+                .last_log_index(),
+            2
+        );
+
+        // The partition heals: node 1 hears from the new leader, steps down,
+        // and its uncommitted entry C is discarded in favor of node 2's
+        // committed B.
+        let healing = cluster
+            .node_mut(NodeId(2))
+            .expect("known node")
+            .step(Event::Tick { next_timeout: 10 });
+        deliver_until_quiescent(&mut cluster, &[], NodeId(2), healing);
+
+        assert_eq!(
+            cluster.node(NodeId(1)).expect("known node").role(),
+            Role::Follower
+        );
+        assert_eq!(
+            cluster.node(NodeId(1)).expect("known node").current_term(),
+            2
+        );
+
+        let committed_log = cluster.node(NodeId(2)).expect("known node").log().to_vec();
+        assert_eq!(
+            cluster.node(NodeId(1)).expect("known node").log(),
+            committed_log.as_slice()
+        );
+        assert_eq!(
+            cluster.node(NodeId(3)).expect("known node").log(),
+            committed_log.as_slice()
+        );
+        assert!(
+            committed_log
+                .iter()
+                .all(|entry| entry.command != vec![b'C']),
+            "an uncommitted entry from a deposed leader must not survive"
         );
     }
 }
