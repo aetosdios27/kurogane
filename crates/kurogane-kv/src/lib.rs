@@ -4,6 +4,8 @@ use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt;
 
+use kurogane_raft::{Effect, Event, Node};
+
 /// A client operation against the replicated key/value state machine.
 /// `Get` is a command, not a side-channel read: routing it through the log
 /// is what makes it linearizable without a heartbeat-lease mechanism.
@@ -175,9 +177,72 @@ impl StateMachine {
     }
 }
 
+/// Wraps a `Node`, automatically draining newly committed log entries into
+/// a `StateMachine` as they land — proposal acceptance (`propose`'s return
+/// value) and application/result delivery (`applied_result`) stay distinct.
+#[derive(Debug)]
+pub struct Replica {
+    node: Node,
+    state_machine: StateMachine,
+    results: BTreeMap<u64, ApplyResult>,
+}
+
+impl Replica {
+    pub fn new(node: Node) -> Self {
+        Self {
+            node,
+            state_machine: StateMachine::new(),
+            results: BTreeMap::new(),
+        }
+    }
+
+    pub fn node(&self) -> &Node {
+        &self.node
+    }
+
+    pub fn state_machine(&self) -> &StateMachine {
+        &self.state_machine
+    }
+
+    /// The outcome of the command applied at `index`, if that index has
+    /// been applied yet. `None` both before commit and in the gap between
+    /// commit and application.
+    pub fn applied_result(&self, index: u64) -> Option<&ApplyResult> {
+        self.results.get(&index)
+    }
+
+    /// Proposes `command` if this replica's node is the leader, returning
+    /// its log index. Never returns the eventual result -- the entry may
+    /// not even commit -- that arrives later through `applied_result`.
+    pub fn propose(&mut self, command: Command) -> Option<u64> {
+        let index = self.node.propose(command.encode())?;
+        self.drain_committed();
+        Some(index)
+    }
+
+    pub fn step(&mut self, event: Event) -> Vec<Effect> {
+        let effects = self.node.step(event);
+        self.drain_committed();
+        effects
+    }
+
+    fn drain_committed(&mut self) {
+        while self.state_machine.last_applied() < self.node.commit_index() {
+            let index = self.state_machine.last_applied() + 1;
+            let entry = &self.node.log()[(index - 1) as usize];
+            let command = Command::decode(&entry.command)
+                .expect("this replica only ever proposes commands it encoded itself");
+            let result = self.state_machine.apply(&command);
+            self.results.insert(index, result);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{ApplyResult, Command, DecodeError, StateMachine};
+    use kurogane_raft::{Node, NodeId, Role};
+
+    use super::{ApplyResult, Command, DecodeError, Event, Replica, StateMachine};
 
     #[test]
     fn round_trips_set() {
@@ -327,5 +392,62 @@ mod tests {
 
         state_machine.apply(&Command::Get { key: vec![1] });
         assert_eq!(state_machine.last_applied(), 2);
+    }
+
+    #[test]
+    fn propose_returns_none_when_not_leader() {
+        let peers = vec![NodeId(1), NodeId(2), NodeId(3)];
+        let node = Node::new(NodeId(1), peers, 5, 2).expect("valid node");
+        let mut replica = Replica::new(node);
+
+        let result = replica.propose(Command::Set {
+            key: vec![1],
+            value: vec![2],
+        });
+
+        assert_eq!(result, None);
+        assert_eq!(replica.state_machine().last_applied(), 0);
+    }
+
+    #[test]
+    fn propose_on_a_single_node_cluster_commits_and_applies_immediately() {
+        let node = Node::new(NodeId(1), vec![NodeId(1)], 1, 1).expect("valid node");
+        let mut replica = Replica::new(node);
+        replica.step(Event::Tick { next_timeout: 5 });
+        assert_eq!(replica.node().role(), Role::Leader);
+
+        let index = replica
+            .propose(Command::Set {
+                key: vec![1],
+                value: vec![9],
+            })
+            .expect("leader accepts propose");
+
+        assert_eq!(
+            replica.applied_result(index),
+            Some(&ApplyResult::Set { previous: None })
+        );
+        assert_eq!(replica.state_machine().get(&[1]), Some(&[9][..]));
+    }
+
+    #[test]
+    fn repeated_steps_with_no_new_commits_never_reapply() {
+        let node = Node::new(NodeId(1), vec![NodeId(1)], 1, 1).expect("valid node");
+        let mut replica = Replica::new(node);
+        replica.step(Event::Tick { next_timeout: 5 });
+        replica.propose(Command::Set {
+            key: vec![1],
+            value: vec![9],
+        });
+        assert_eq!(replica.state_machine().last_applied(), 1);
+
+        replica.step(Event::Tick { next_timeout: 5 });
+        replica.step(Event::Tick { next_timeout: 5 });
+
+        assert_eq!(replica.state_machine().last_applied(), 1);
+        assert_eq!(
+            replica.applied_result(1),
+            Some(&ApplyResult::Set { previous: None })
+        );
     }
 }
