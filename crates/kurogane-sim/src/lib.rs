@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt;
 
-use kurogane_raft::{Effect, Event, Message, Node, NodeId, Role};
+use kurogane_raft::{Effect, Event, HardState, LogEntry, Message, Node, NodeId, Role};
 
 /// Invalid construction of a deterministic cluster.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -100,6 +100,58 @@ impl Cluster {
 
     pub fn node_ids(&self) -> impl ExactSizeIterator<Item = NodeId> + '_ {
         self.nodes.keys().copied()
+    }
+
+    /// Replaces one member's node in place — e.g. after simulating a crash
+    /// and reconstructing it with `Node::recover`. The ID must already be a
+    /// cluster member; this changes what a node *is*, not the membership.
+    pub fn replace_node(&mut self, node: Node) {
+        debug_assert!(
+            self.nodes.contains_key(&node.id()),
+            "replace_node must target an existing member"
+        );
+        self.nodes.insert(node.id(), node);
+    }
+}
+
+/// One node's simulated durable storage: whatever `HardState`/log entries
+/// have actually been confirmed via `Persist*` effects. A crash discards
+/// everything else — reconstructing a node from a `DurableState` is exactly
+/// what a real restart-from-disk would see.
+#[derive(Clone, Debug, Default)]
+pub struct DurableState {
+    hard_state: HardState,
+    log: Vec<LogEntry>,
+}
+
+impl DurableState {
+    pub fn hard_state(&self) -> HardState {
+        self.hard_state
+    }
+
+    pub fn log(&self) -> &[LogEntry] {
+        &self.log
+    }
+
+    /// Records one effect as durably written. `Send` is not persistence and
+    /// is ignored.
+    pub fn apply(&mut self, effect: &Effect) {
+        match effect {
+            Effect::PersistHardState { term, voted_for } => {
+                self.hard_state = HardState {
+                    current_term: *term,
+                    voted_for: *voted_for,
+                };
+            }
+            Effect::PersistLog {
+                from_index,
+                entries,
+            } => {
+                self.log.truncate((*from_index - 1) as usize);
+                self.log.extend(entries.iter().cloned());
+            }
+            Effect::Send { .. } => {}
+        }
     }
 }
 
@@ -268,9 +320,9 @@ impl Simulation {
 
 #[cfg(test)]
 mod tests {
-    use kurogane_raft::{Node, NodeId};
+    use kurogane_raft::{Effect, HardState, LogEntry, Node, NodeId};
 
-    use super::{Cluster, ClusterError};
+    use super::{Cluster, ClusterError, DurableState};
 
     fn node(id: u64, peers: &[NodeId]) -> Node {
         Node::new(NodeId(id), peers.to_vec(), 10 + id, 1).expect("valid node")
@@ -319,6 +371,112 @@ mod tests {
             incomplete.expect_err("all members must be present"),
             ClusterError::MissingNode(NodeId(2))
         );
+    }
+
+    #[test]
+    fn replace_node_swaps_a_member_in_place() {
+        let peers = [NodeId(1), NodeId(2)];
+        let mut cluster =
+            Cluster::new(vec![node(1, &peers), node(2, &peers)]).expect("valid cluster");
+
+        let recovered = Node::recover(
+            NodeId(1),
+            peers.to_vec(),
+            11,
+            1,
+            HardState {
+                current_term: 7,
+                voted_for: Some(NodeId(2)),
+            },
+            Vec::new(),
+        )
+        .expect("valid node");
+        cluster.replace_node(recovered);
+
+        assert_eq!(cluster.len(), 2);
+        assert_eq!(
+            cluster.node(NodeId(1)).expect("known node").current_term(),
+            7
+        );
+        assert_eq!(
+            cluster.node(NodeId(1)).expect("known node").voted_for(),
+            Some(NodeId(2))
+        );
+    }
+
+    #[test]
+    fn durable_state_accumulates_hard_state_and_splices_the_log() {
+        let mut durable = DurableState::default();
+
+        durable.apply(&Effect::PersistHardState {
+            term: 1,
+            voted_for: Some(NodeId(2)),
+        });
+        durable.apply(&Effect::PersistLog {
+            from_index: 1,
+            entries: vec![
+                LogEntry {
+                    term: 1,
+                    command: vec![1],
+                },
+                LogEntry {
+                    term: 1,
+                    command: vec![2],
+                },
+            ],
+        });
+
+        assert_eq!(
+            durable.hard_state(),
+            HardState {
+                current_term: 1,
+                voted_for: Some(NodeId(2)),
+            }
+        );
+        assert_eq!(durable.log().len(), 2);
+
+        // A conflict-truncate at index 2 replaces the tail, same as
+        // on_append_entries does in-memory.
+        let replacement = LogEntry {
+            term: 2,
+            command: vec![9],
+        };
+        durable.apply(&Effect::PersistHardState {
+            term: 2,
+            voted_for: None,
+        });
+        durable.apply(&Effect::PersistLog {
+            from_index: 2,
+            entries: vec![replacement.clone()],
+        });
+
+        assert_eq!(
+            durable.hard_state(),
+            HardState {
+                current_term: 2,
+                voted_for: None,
+            }
+        );
+        assert_eq!(durable.log().len(), 2);
+        assert_eq!(durable.log()[1], replacement);
+    }
+
+    #[test]
+    fn durable_state_ignores_send_effects() {
+        use kurogane_raft::{Message, RequestVoteResponse};
+
+        let mut durable = DurableState::default();
+
+        durable.apply(&Effect::Send {
+            to: NodeId(2),
+            message: Message::RequestVoteResponse(RequestVoteResponse {
+                term: 1,
+                granted: true,
+            }),
+        });
+
+        assert_eq!(durable.hard_state(), HardState::default());
+        assert!(durable.log().is_empty());
     }
 }
 
