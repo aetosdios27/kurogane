@@ -61,10 +61,53 @@ impl<T: PeerTransport> Actor<T> {
         self.leader_hint
     }
 
+    /// For a `Tick`, or an incoming peer *response*
+    /// (`RequestVoteResponse`/`AppendEntriesResponse`) — there's no specific
+    /// reply target for either, so every resulting effect (including a
+    /// retry `Send`) is dispatched normally.
     pub fn handle_event(&mut self, event: Event) -> io::Result<()> {
-        self.update_leader_hint(&event);
+        if let Event::Step { from, message } = &event {
+            self.update_leader_hint(*from, message);
+        }
         let effects = self.replica.step(event);
         self.dispatch(effects)
+    }
+
+    /// For an incoming peer *request* (`RequestVote`/`AppendEntries`)
+    /// arriving over one specific RPC call: persists everything as usual,
+    /// but returns the response message for the caller to reply with
+    /// directly, rather than dispatching it through `PeerTransport` — it's
+    /// a reply to this exact call, not a fresh outbound send.
+    ///
+    /// `Ok(None)` means `kurogane-raft` silently dropped the request (an
+    /// unrecognized `from`, or a `candidate_id`/`leader_id` that doesn't
+    /// match it) — that's untrusted network input, not a bug, so the caller
+    /// gets a clean "no reply" instead of this panicking. A message that
+    /// *did* pass those checks always ends in exactly one `Send`; only that
+    /// case would be an internal invariant violation worth panicking over.
+    pub fn handle_peer_request(
+        &mut self,
+        from: NodeId,
+        message: Message,
+    ) -> io::Result<Option<Message>> {
+        self.update_leader_hint(from, &message);
+
+        let mut effects = self.replica.step(Event::Step { from, message });
+        let Some(last) = effects.pop() else {
+            return Ok(None);
+        };
+        let reply = match last {
+            Effect::Send { message, .. } => message,
+            _ => panic!(
+                "a RequestVote/AppendEntries request that produced any effects must end with exactly one Send"
+            ),
+        };
+        for effect in &effects {
+            if let Effect::PersistHardState { .. } | Effect::PersistLog { .. } = effect {
+                self.storage.apply(effect)?;
+            }
+        }
+        Ok(Some(reply))
     }
 
     /// Proposes `command` if this node is the leader, returning its log
@@ -78,18 +121,14 @@ impl<T: PeerTransport> Actor<T> {
         Ok(Some(index))
     }
 
-    fn update_leader_hint(&mut self, event: &Event) {
-        let Event::Step {
-            message: Message::AppendEntries(request),
-            ..
-        } = event
-        else {
+    fn update_leader_hint(&mut self, from: NodeId, message: &Message) {
+        let Message::AppendEntries(request) = message else {
             return;
         };
         // Mirrors on_append_entries's own stale-term rejection: a request
         // that would be rejected tells us nothing about who's actually
         // leading right now.
-        if request.term >= self.replica.node().current_term() {
+        if request.leader_id == from && request.term >= self.replica.node().current_term() {
             self.leader_hint = Some(request.leader_id);
         }
     }
@@ -106,6 +145,134 @@ impl<T: PeerTransport> Actor<T> {
             }
         }
         Ok(())
+    }
+}
+
+/// One request to the actor's task, routed through an `ActorHandle`.
+enum ActorRequest {
+    Tick {
+        next_timeout: u64,
+    },
+    PeerRequest {
+        from: NodeId,
+        message: Message,
+        reply: tokio::sync::oneshot::Sender<Option<Message>>,
+    },
+    PeerResponse {
+        from: NodeId,
+        message: Message,
+    },
+    Propose {
+        command: Command,
+        reply: tokio::sync::oneshot::Sender<Option<u64>>,
+    },
+}
+
+/// A cheaply cloneable way to submit work to an actor running in its own
+/// task. The `Actor` itself is never shared across tasks directly — this is
+/// the one door in, matching `decisions.md`'s "one authoritative node state
+/// owner."
+#[derive(Clone)]
+pub struct ActorHandle {
+    sender: tokio::sync::mpsc::Sender<ActorRequest>,
+}
+
+impl ActorHandle {
+    /// Submits an incoming peer request and awaits its response.
+    /// Backpressure applies here (this is a real RPC that needs an answer),
+    /// unlike `tick`/`peer_response`, which are fire-and-forget. Outer
+    /// `None` means the actor task is gone; inner `None` means
+    /// `kurogane-raft` dropped the request (see `Actor::handle_peer_request`).
+    pub async fn peer_request(&self, from: NodeId, message: Message) -> Option<Option<Message>> {
+        let (reply, receiver) = tokio::sync::oneshot::channel();
+        self.sender
+            .send(ActorRequest::PeerRequest {
+                from,
+                message,
+                reply,
+            })
+            .await
+            .ok()?;
+        receiver.await.ok()
+    }
+
+    /// Submits an incoming peer response. Fire-and-forget: dropped under
+    /// backpressure, same as any other `Send` effect — Raft's own retry
+    /// logic covers it.
+    pub fn peer_response(&self, from: NodeId, message: Message) {
+        let _ = self
+            .sender
+            .try_send(ActorRequest::PeerResponse { from, message });
+    }
+
+    /// Submits a client propose request and awaits its result. Outer
+    /// `None` means the actor task is gone; inner `None` means it wasn't
+    /// the leader.
+    pub async fn propose(&self, command: Command) -> Option<Option<u64>> {
+        let (reply, receiver) = tokio::sync::oneshot::channel();
+        self.sender
+            .send(ActorRequest::Propose { command, reply })
+            .await
+            .ok()?;
+        receiver.await.ok()
+    }
+
+    /// Submits a logical tick. Fire-and-forget, same reasoning as
+    /// `peer_response`.
+    pub fn tick(&self, next_timeout: u64) {
+        let _ = self.sender.try_send(ActorRequest::Tick { next_timeout });
+    }
+}
+
+/// The receiving half of an actor's channel. Opaque on purpose — only
+/// `run` drains it, so `ActorRequest` itself never needs to be public.
+pub struct ActorReceiver {
+    receiver: tokio::sync::mpsc::Receiver<ActorRequest>,
+}
+
+/// Creates an actor task's channel pair: the `ActorHandle` other tasks use
+/// to submit work, and the receiver `run` drains.
+pub fn channel(capacity: usize) -> (ActorHandle, ActorReceiver) {
+    let (sender, receiver) = tokio::sync::mpsc::channel(capacity);
+    (ActorHandle { sender }, ActorReceiver { receiver })
+}
+
+/// Runs `actor` until its channel closes, draining one request at a time —
+/// this is what makes it the single authoritative owner of the underlying
+/// `Replica`. Panics if a `Persist*` effect fails to write durably rather
+/// than silently continuing in a state that might violate the
+/// write-before-send contract; graceful disk-failure handling is out of
+/// scope for this milestone.
+pub async fn run<T: PeerTransport>(mut actor: Actor<T>, mut requests: ActorReceiver) {
+    while let Some(request) = requests.receiver.recv().await {
+        match request {
+            ActorRequest::Tick { next_timeout } => {
+                actor
+                    .handle_event(Event::Tick { next_timeout })
+                    .expect("durable storage write must succeed");
+            }
+            ActorRequest::PeerRequest {
+                from,
+                message,
+                reply,
+            } => {
+                let response = actor
+                    .handle_peer_request(from, message)
+                    .expect("durable storage write must succeed");
+                let _ = reply.send(response);
+            }
+            ActorRequest::PeerResponse { from, message } => {
+                actor
+                    .handle_event(Event::Step { from, message })
+                    .expect("durable storage write must succeed");
+            }
+            ActorRequest::Propose { command, reply } => {
+                let result = actor
+                    .propose(command)
+                    .expect("durable storage write must succeed");
+                let _ = reply.send(result);
+            }
+        }
     }
 }
 
@@ -318,5 +485,107 @@ mod tests {
         let reopened = Storage::open(&path).expect("reopen storage");
         assert_eq!(reopened.hard_state().current_term, 1);
         assert_eq!(reopened.hard_state().voted_for, Some(RaftNodeId(2)));
+    }
+
+    #[test]
+    fn handle_peer_request_returns_the_reply_directly_without_double_sending() {
+        let peers = vec![RaftNodeId(1), RaftNodeId(2), RaftNodeId(3)];
+        let mut actor = actor(RaftNodeId(1), peers, 5, 2);
+
+        let reply = actor
+            .handle_peer_request(
+                RaftNodeId(2),
+                Message::RequestVote(kurogane_raft::RequestVote {
+                    term: 1,
+                    candidate_id: RaftNodeId(2),
+                    last_log_index: 0,
+                    last_log_term: 0,
+                }),
+            )
+            .expect("handle peer request")
+            .expect("recognized member, request produces a reply");
+
+        assert_eq!(
+            reply,
+            Message::RequestVoteResponse(RequestVoteResponse {
+                term: 1,
+                granted: true,
+            })
+        );
+        // The reply went back as this call's return value, not through
+        // PeerTransport -- nothing was queued for outbound delivery.
+        assert!(actor.transport.sent.is_empty());
+    }
+
+    #[test]
+    fn handle_peer_request_from_a_nonmember_returns_none_without_panicking() {
+        let peers = vec![RaftNodeId(1), RaftNodeId(2), RaftNodeId(3)];
+        let mut actor = actor(RaftNodeId(1), peers, 5, 2);
+
+        let reply = actor
+            .handle_peer_request(
+                RaftNodeId(9),
+                Message::RequestVote(kurogane_raft::RequestVote {
+                    term: 1,
+                    candidate_id: RaftNodeId(9),
+                    last_log_index: 0,
+                    last_log_term: 0,
+                }),
+            )
+            .expect("handle peer request");
+
+        assert_eq!(reply, None);
+        assert_eq!(actor.node().current_term(), 0);
+    }
+
+    #[tokio::test]
+    async fn actor_handle_round_trips_a_peer_request_through_the_channel() {
+        let peers = vec![RaftNodeId(1), RaftNodeId(2), RaftNodeId(3)];
+        let actor = actor(RaftNodeId(1), peers, 5, 2);
+        let (handle, receiver) = channel(8);
+        tokio::spawn(run(actor, receiver));
+
+        let reply = handle
+            .peer_request(
+                RaftNodeId(2),
+                Message::RequestVote(kurogane_raft::RequestVote {
+                    term: 1,
+                    candidate_id: RaftNodeId(2),
+                    last_log_index: 0,
+                    last_log_term: 0,
+                }),
+            )
+            .await
+            .expect("actor task is alive")
+            .expect("recognized member, request produces a reply");
+
+        assert_eq!(
+            reply,
+            Message::RequestVoteResponse(RequestVoteResponse {
+                term: 1,
+                granted: true,
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn actor_handle_round_trips_propose_on_a_single_node_cluster() {
+        let actor = actor(RaftNodeId(1), vec![RaftNodeId(1)], 1, 1);
+        let (handle, receiver) = channel(8);
+        tokio::spawn(run(actor, receiver));
+
+        handle.tick(5);
+        // Give the spawned task a chance to process the tick before
+        // proposing; propose() itself awaits a reply, so no sleep is
+        // needed beyond that ordering guarantee once it's in the channel.
+        let index = handle
+            .propose(Command::Set {
+                key: vec![1],
+                value: vec![9],
+            })
+            .await
+            .expect("actor task is alive");
+
+        assert_eq!(index, Some(1));
     }
 }

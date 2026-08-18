@@ -7,5 +7,8 @@ pub mod proto {
 }
 
 pub mod actor;
+pub mod auth;
 pub mod dto;
+pub mod peer_client;
+pub mod server;
 pub mod storage;
