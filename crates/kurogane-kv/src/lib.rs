@@ -1,5 +1,6 @@
 //! Replicated in-memory key/value state machine on top of `kurogane-raft`.
 
+use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt;
 
@@ -122,9 +123,61 @@ impl<'a> ByteReader<'a> {
     }
 }
 
+/// The outcome of applying one command, kept around for later retrieval —
+/// see `Replica::applied_result`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ApplyResult {
+    Set { previous: Option<Vec<u8>> },
+    Delete { previous: Option<Vec<u8>> },
+    Get { value: Option<Vec<u8>> },
+}
+
+/// The replicated key/value map. Owns only in-memory state; persistence is
+/// milestone five's job.
+#[derive(Debug, Default)]
+pub struct StateMachine {
+    entries: BTreeMap<Vec<u8>, Vec<u8>>,
+    last_applied: u64,
+}
+
+impl StateMachine {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn last_applied(&self) -> u64 {
+        self.last_applied
+    }
+
+    pub fn get(&self, key: &[u8]) -> Option<&[u8]> {
+        self.entries.get(key).map(Vec::as_slice)
+    }
+
+    /// Applies `command` as the next entry in order, advancing
+    /// `last_applied` by exactly one. The caller owns index bookkeeping
+    /// (see `Replica`) — this trusts it, rather than re-validating an
+    /// invariant only one caller can ever violate.
+    pub fn apply(&mut self, command: &Command) -> ApplyResult {
+        self.last_applied += 1;
+        match command {
+            Command::Set { key, value } => {
+                let previous = self.entries.insert(key.clone(), value.clone());
+                ApplyResult::Set { previous }
+            }
+            Command::Delete { key } => {
+                let previous = self.entries.remove(key);
+                ApplyResult::Delete { previous }
+            }
+            Command::Get { key } => ApplyResult::Get {
+                value: self.entries.get(key).cloned(),
+            },
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{Command, DecodeError};
+    use super::{ApplyResult, Command, DecodeError, StateMachine};
 
     #[test]
     fn round_trips_set() {
@@ -182,5 +235,97 @@ mod tests {
             Command::decode(&[0, 0, 0, 0, 5, 1, 2]),
             Err(DecodeError::Truncated)
         );
+    }
+
+    #[test]
+    fn set_returns_previous_value_and_stores_the_new_one() {
+        let mut state_machine = StateMachine::new();
+
+        let first = state_machine.apply(&Command::Set {
+            key: vec![1],
+            value: vec![10],
+        });
+        assert_eq!(first, ApplyResult::Set { previous: None });
+        assert_eq!(state_machine.get(&[1]), Some(&[10][..]));
+
+        let second = state_machine.apply(&Command::Set {
+            key: vec![1],
+            value: vec![20],
+        });
+        assert_eq!(
+            second,
+            ApplyResult::Set {
+                previous: Some(vec![10])
+            }
+        );
+        assert_eq!(state_machine.get(&[1]), Some(&[20][..]));
+    }
+
+    #[test]
+    fn delete_returns_and_removes_the_previous_value() {
+        let mut state_machine = StateMachine::new();
+        state_machine.apply(&Command::Set {
+            key: vec![1],
+            value: vec![10],
+        });
+
+        let result = state_machine.apply(&Command::Delete { key: vec![1] });
+
+        assert_eq!(
+            result,
+            ApplyResult::Delete {
+                previous: Some(vec![10])
+            }
+        );
+        assert_eq!(state_machine.get(&[1]), None);
+    }
+
+    #[test]
+    fn delete_of_an_absent_key_returns_none() {
+        let mut state_machine = StateMachine::new();
+
+        let result = state_machine.apply(&Command::Delete { key: vec![9] });
+
+        assert_eq!(result, ApplyResult::Delete { previous: None });
+    }
+
+    #[test]
+    fn get_returns_the_current_value_without_mutating_it() {
+        let mut state_machine = StateMachine::new();
+        state_machine.apply(&Command::Set {
+            key: vec![1],
+            value: vec![10],
+        });
+
+        let result = state_machine.apply(&Command::Get { key: vec![1] });
+
+        assert_eq!(
+            result,
+            ApplyResult::Get {
+                value: Some(vec![10])
+            }
+        );
+        assert_eq!(state_machine.get(&[1]), Some(&[10][..]));
+    }
+
+    #[test]
+    fn get_of_an_absent_key_returns_none() {
+        let mut state_machine = StateMachine::new();
+
+        let result = state_machine.apply(&Command::Get { key: vec![1] });
+
+        assert_eq!(result, ApplyResult::Get { value: None });
+    }
+
+    #[test]
+    fn apply_advances_last_applied_by_one_each_time() {
+        let mut state_machine = StateMachine::new();
+        assert_eq!(state_machine.last_applied(), 0);
+
+        state_machine.apply(&Command::Get { key: vec![1] });
+        assert_eq!(state_machine.last_applied(), 1);
+
+        state_machine.apply(&Command::Get { key: vec![1] });
+        assert_eq!(state_machine.last_applied(), 2);
     }
 }
