@@ -7,3 +7,4 @@ pub mod proto {
 }
 
 pub mod dto;
+pub mod storage;

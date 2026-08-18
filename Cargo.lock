@@ -381,6 +381,7 @@ dependencies = [
  "kurogane-raft",
  "prost",
  "protoc-bin-vendored",
+ "tempfile",
  "tokio",
  "tonic",
  "tonic-prost",

@@ -92,3 +92,15 @@ message NotLeader {
 service RaftClient {
   rpc Propose(ProposeRequest) returns (ProposeReply);
 }
+
+// On-disk durable state. Not part of any RPC -- reused here rather than
+// hand-rolling a third encoding, since this crate already depends on prost
+// for the wire protocol. Rewritten and fsynced whole on every write; no WAL,
+// checksums, or compaction yet (Milestone 7 territory once snapshots force
+// the question).
+message StorageState {
+  uint64 current_term = 1;
+  optional uint64 voted_for = 2;
+  repeated LogEntry log = 3;
+}
+
