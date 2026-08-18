@@ -269,7 +269,7 @@ mod tests {
     use super::{Cluster, ClusterError};
 
     fn node(id: u64, peers: &[NodeId]) -> Node {
-        Node::new(NodeId(id), peers.to_vec(), 10 + id).expect("valid node")
+        Node::new(NodeId(id), peers.to_vec(), 10 + id, 1).expect("valid node")
     }
 
     #[test]
@@ -323,17 +323,21 @@ mod simulation_tests {
     use std::collections::BTreeMap;
 
     use kurogane_raft::{
-        Effect, Event, Message, Node, NodeId, RequestVote, RequestVoteResponse, Role,
+        AppendEntries, AppendEntriesResponse, Effect, Event, Message, Node, NodeId, RequestVote,
+        RequestVoteResponse, Role,
     };
 
     use super::{Cluster, Simulation};
 
-    fn three_node_cluster(election_timeout: u64) -> Cluster {
+    fn three_node_cluster(election_timeout: u64, heartbeat_interval: u64) -> Cluster {
         let peers = [NodeId(1), NodeId(2), NodeId(3)];
         Cluster::new(
             peers
                 .iter()
-                .map(|&id| Node::new(id, peers.to_vec(), election_timeout).expect("valid node"))
+                .map(|&id| {
+                    Node::new(id, peers.to_vec(), election_timeout, heartbeat_interval)
+                        .expect("valid node")
+                })
                 .collect(),
         )
         .expect("valid cluster")
@@ -377,15 +381,15 @@ mod simulation_tests {
 
     #[test]
     fn elects_a_single_leader_and_never_two_in_the_same_term() {
-        let mut simulation = Simulation::new(three_node_cluster(3), 42, 3, 6, 1, 2);
+        let mut simulation = Simulation::new(three_node_cluster(3, 1), 42, 3, 6, 1, 2);
 
         run_until_leader_checking_invariants(&mut simulation, 200);
     }
 
     #[test]
     fn same_seed_and_schedule_reproduces_an_identical_trace() {
-        let mut first = Simulation::new(three_node_cluster(3), 7, 3, 6, 1, 2);
-        let mut second = Simulation::new(three_node_cluster(3), 7, 3, 6, 1, 2);
+        let mut first = Simulation::new(three_node_cluster(3, 1), 7, 3, 6, 1, 2);
+        let mut second = Simulation::new(three_node_cluster(3, 1), 7, 3, 6, 1, 2);
 
         for _ in 0..50 {
             first.step();
@@ -396,12 +400,147 @@ mod simulation_tests {
     }
 
     #[test]
+    fn stable_leadership_prevents_unnecessary_elections_under_delivered_heartbeats() {
+        let mut simulation = Simulation::new(three_node_cluster(4, 1), 99, 4, 6, 1, 1);
+
+        let leader = run_until_leader_checking_invariants(&mut simulation, 200);
+        let leader_term = simulation
+            .leaders()
+            .into_iter()
+            .find(|&(id, _)| id == leader)
+            .map(|(_, term)| term)
+            .expect("elected leader must report a term");
+
+        // A short, fixed heartbeat interval and delivery delay well under the
+        // election timeout should keep every follower's timer reset, so no
+        // one else should ever become a candidate.
+        for _ in 0..100 {
+            simulation.step();
+            assert_eq!(simulation.leaders(), vec![(leader, leader_term)]);
+        }
+    }
+
+    #[test]
+    fn an_isolated_old_leader_steps_down_once_a_higher_term_message_reaches_it() {
+        let peers = [NodeId(1), NodeId(2), NodeId(3)];
+        let mut cluster = Cluster::new(
+            peers
+                .iter()
+                .map(|&id| Node::new(id, peers.to_vec(), 1, 1).expect("valid node"))
+                .collect(),
+        )
+        .expect("valid cluster");
+
+        // Node 1 wins term 1 uncontested.
+        let requests = cluster
+            .node_mut(NodeId(1))
+            .expect("known node")
+            .step(Event::Tick { next_timeout: 10 });
+        for Effect::Send { to, message } in requests {
+            let responses = cluster.node_mut(to).expect("known node").step(Event::Step {
+                from: NodeId(1),
+                message,
+            });
+            for Effect::Send {
+                to: respond_to,
+                message,
+            } in responses
+            {
+                cluster
+                    .node_mut(respond_to)
+                    .expect("known node")
+                    .step(Event::Step { from: to, message });
+            }
+        }
+        assert_eq!(
+            cluster.node(NodeId(1)).expect("known node").role(),
+            Role::Leader
+        );
+        assert_eq!(
+            cluster.node(NodeId(1)).expect("known node").current_term(),
+            1
+        );
+
+        // Node 1 is isolated from here on: nothing is ever delivered to or from
+        // it again until the healing step below. Nodes 2 and 3 time out on
+        // their own and elect node 2 for term 2 without node 1 seeing anything.
+        let node2_requests = cluster
+            .node_mut(NodeId(2))
+            .expect("known node")
+            .step(Event::Tick { next_timeout: 10 });
+        for Effect::Send { to, message } in node2_requests {
+            if to != NodeId(3) {
+                continue;
+            }
+            let responses = cluster.node_mut(to).expect("known node").step(Event::Step {
+                from: NodeId(2),
+                message,
+            });
+            for Effect::Send {
+                to: respond_to,
+                message,
+            } in responses
+            {
+                cluster
+                    .node_mut(respond_to)
+                    .expect("known node")
+                    .step(Event::Step { from: to, message });
+            }
+        }
+        assert_eq!(
+            cluster.node(NodeId(2)).expect("known node").role(),
+            Role::Leader
+        );
+        assert_eq!(
+            cluster.node(NodeId(2)).expect("known node").current_term(),
+            2
+        );
+        assert_eq!(
+            cluster.node(NodeId(1)).expect("known node").role(),
+            Role::Leader
+        );
+        assert_eq!(
+            cluster.node(NodeId(1)).expect("known node").current_term(),
+            1
+        );
+
+        // The partition heals: node 1 finally receives a heartbeat from the new
+        // leader and steps down.
+        let effects = cluster
+            .node_mut(NodeId(1))
+            .expect("known node")
+            .step(Event::Step {
+                from: NodeId(2),
+                message: Message::AppendEntries(AppendEntries {
+                    term: 2,
+                    leader_id: NodeId(2),
+                }),
+            });
+
+        assert_eq!(
+            cluster.node(NodeId(1)).expect("known node").role(),
+            Role::Follower
+        );
+        assert_eq!(
+            cluster.node(NodeId(1)).expect("known node").current_term(),
+            2
+        );
+        assert_eq!(
+            effects,
+            vec![Effect::Send {
+                to: NodeId(2),
+                message: Message::AppendEntriesResponse(AppendEntriesResponse { term: 2 }),
+            }]
+        );
+    }
+
+    #[test]
     fn recovers_from_a_simultaneous_split_vote_via_a_later_timeout() {
         let peers = [NodeId(1), NodeId(2), NodeId(3)];
         let mut cluster = Cluster::new(
             peers
                 .iter()
-                .map(|&id| Node::new(id, peers.to_vec(), 1).expect("valid node"))
+                .map(|&id| Node::new(id, peers.to_vec(), 1, 1).expect("valid node"))
                 .collect(),
         )
         .expect("valid cluster");
@@ -495,7 +634,7 @@ mod simulation_tests {
 
     #[test]
     fn rejects_a_stale_term_request_vote_once_a_leader_is_established() {
-        let mut cluster = three_node_cluster(1);
+        let mut cluster = three_node_cluster(1, 1);
 
         let requests = cluster
             .node_mut(NodeId(1))
