@@ -1,0 +1,21 @@
+[package]
+name = "kurogane-runtime"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+kurogane-raft = { path = "../kurogane-raft" }
+kurogane-kv = { path = "../kurogane-kv" }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "time", "sync", "macros", "signal"] }
+tonic = "0.14"
+tonic-prost = "0.14"
+prost = "0.14"
+
+[build-dependencies]
+protoc-bin-vendored = "3.2.0"
+tonic-prost-build = "0.14"
+
+[lints]
+workspace = true
