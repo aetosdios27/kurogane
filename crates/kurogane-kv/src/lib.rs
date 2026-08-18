@@ -240,9 +240,11 @@ impl Replica {
 
 #[cfg(test)]
 mod tests {
-    use kurogane_raft::{Node, NodeId, Role};
+    use std::collections::BTreeMap;
 
-    use super::{ApplyResult, Command, DecodeError, Event, Replica, StateMachine};
+    use kurogane_raft::{Message, Node, NodeId, Role};
+
+    use super::{ApplyResult, Command, DecodeError, Effect, Event, Replica, StateMachine};
 
     #[test]
     fn round_trips_set() {
@@ -448,6 +450,209 @@ mod tests {
         assert_eq!(
             replica.applied_result(1),
             Some(&ApplyResult::Set { previous: None })
+        );
+    }
+
+    fn three_replica_cluster(
+        election_timeout: u64,
+        heartbeat_interval: u64,
+    ) -> BTreeMap<NodeId, Replica> {
+        let peers = vec![NodeId(1), NodeId(2), NodeId(3)];
+        peers
+            .iter()
+            .map(|&id| {
+                let node = Node::new(id, peers.clone(), election_timeout, heartbeat_interval)
+                    .expect("valid node");
+                (id, Replica::new(node))
+            })
+            .collect()
+    }
+
+    /// Delivers `effects` (sent by `from`) to their targets, then
+    /// recursively delivers whatever those deliveries produce, until
+    /// nothing remains in flight. Mirrors `kurogane-sim`'s
+    /// `deliver_until_quiescent`, scoped to `Replica` instead of `Node`.
+    fn deliver_until_quiescent(
+        replicas: &mut BTreeMap<NodeId, Replica>,
+        isolated: &[NodeId],
+        from: NodeId,
+        effects: Vec<Effect>,
+    ) {
+        let mut pending: Vec<(NodeId, NodeId, Message)> = effects
+            .into_iter()
+            .filter(|Effect::Send { to, .. }| !isolated.contains(to))
+            .map(|Effect::Send { to, message }| (from, to, message))
+            .collect();
+
+        let mut guard = 0;
+        while let Some((from, to, message)) = pending.pop() {
+            guard += 1;
+            assert!(guard < 10_000, "deliver_until_quiescent did not converge");
+
+            let response = replicas
+                .get_mut(&to)
+                .expect("known replica")
+                .step(Event::Step { from, message });
+            pending.extend(
+                response
+                    .into_iter()
+                    .filter(|Effect::Send { to, .. }| !isolated.contains(to))
+                    .map(
+                        |Effect::Send {
+                             to: respond_to,
+                             message,
+                         }| (to, respond_to, message),
+                    ),
+            );
+        }
+    }
+
+    #[test]
+    fn three_replicas_converge_after_a_mix_of_set_and_delete_commands() {
+        let mut replicas = three_replica_cluster(1, 1);
+
+        let requests = replicas
+            .get_mut(&NodeId(1))
+            .expect("known replica")
+            .step(Event::Tick { next_timeout: 10 });
+        deliver_until_quiescent(&mut replicas, &[], NodeId(1), requests);
+        assert_eq!(replicas[&NodeId(1)].node().role(), Role::Leader);
+
+        let leader = replicas.get_mut(&NodeId(1)).expect("known replica");
+        leader.propose(Command::Set {
+            key: vec![1],
+            value: vec![10],
+        });
+        leader.propose(Command::Set {
+            key: vec![2],
+            value: vec![20],
+        });
+        leader.propose(Command::Delete { key: vec![1] });
+
+        // First round replicates the entries and lets the leader see a
+        // majority ack, committing locally. Followers only learn the leader
+        // committed via leader_commit on a *later* AppendEntries, so a
+        // second round is required before their own state machines catch up.
+        for _ in 0..2 {
+            let heartbeat = replicas
+                .get_mut(&NodeId(1))
+                .expect("known replica")
+                .step(Event::Tick { next_timeout: 10 });
+            deliver_until_quiescent(&mut replicas, &[], NodeId(1), heartbeat);
+        }
+
+        for id in [NodeId(1), NodeId(2), NodeId(3)] {
+            let state = replicas[&id].state_machine();
+            assert_eq!(state.get(&[1]), None);
+            assert_eq!(state.get(&[2]), Some(&[20][..]));
+        }
+    }
+
+    #[test]
+    fn healed_partition_preserves_committed_commands_and_discards_uncommitted_ones() {
+        let mut replicas = three_replica_cluster(1, 1);
+
+        // Node 1 wins term 1 uncontested and commits a Set.
+        let requests = replicas
+            .get_mut(&NodeId(1))
+            .expect("known replica")
+            .step(Event::Tick { next_timeout: 10 });
+        deliver_until_quiescent(&mut replicas, &[], NodeId(1), requests);
+        assert_eq!(replicas[&NodeId(1)].node().role(), Role::Leader);
+
+        replicas
+            .get_mut(&NodeId(1))
+            .expect("known replica")
+            .propose(Command::Set {
+                key: b"x".to_vec(),
+                value: b"committed".to_vec(),
+            });
+        let heartbeat = replicas
+            .get_mut(&NodeId(1))
+            .expect("known replica")
+            .step(Event::Tick { next_timeout: 10 });
+        deliver_until_quiescent(&mut replicas, &[], NodeId(1), heartbeat);
+        assert_eq!(replicas[&NodeId(1)].node().commit_index(), 1);
+
+        // Node 1 proposes one more command that never leaves its own log,
+        // then is isolated before it can replicate.
+        replicas
+            .get_mut(&NodeId(1))
+            .expect("known replica")
+            .propose(Command::Set {
+                key: b"x".to_vec(),
+                value: b"lost".to_vec(),
+            });
+
+        // Node 2 wins term 2 with node 3's vote; node 1 never hears about it.
+        let node2_requests = replicas
+            .get_mut(&NodeId(2))
+            .expect("known replica")
+            .step(Event::Tick { next_timeout: 10 });
+        deliver_until_quiescent(&mut replicas, &[NodeId(1)], NodeId(2), node2_requests);
+        assert_eq!(replicas[&NodeId(2)].node().role(), Role::Leader);
+
+        replicas
+            .get_mut(&NodeId(2))
+            .expect("known replica")
+            .propose(Command::Set {
+                key: b"x".to_vec(),
+                value: b"winner".to_vec(),
+            });
+        let node2_heartbeat = replicas
+            .get_mut(&NodeId(2))
+            .expect("known replica")
+            .step(Event::Tick { next_timeout: 10 });
+        deliver_until_quiescent(&mut replicas, &[NodeId(1)], NodeId(2), node2_heartbeat);
+        assert_eq!(replicas[&NodeId(2)].node().commit_index(), 2);
+
+        // The partition heals: node 1 hears from the new leader and
+        // converges onto its committed history.
+        let healing = replicas
+            .get_mut(&NodeId(2))
+            .expect("known replica")
+            .step(Event::Tick { next_timeout: 10 });
+        deliver_until_quiescent(&mut replicas, &[], NodeId(2), healing);
+
+        for id in [NodeId(1), NodeId(2), NodeId(3)] {
+            assert_eq!(
+                replicas[&id].state_machine().get(b"x"),
+                Some(&b"winner"[..])
+            );
+        }
+    }
+
+    #[test]
+    fn a_get_routed_through_the_log_returns_the_previously_written_value() {
+        let mut replicas = three_replica_cluster(1, 1);
+
+        let requests = replicas
+            .get_mut(&NodeId(1))
+            .expect("known replica")
+            .step(Event::Tick { next_timeout: 10 });
+        deliver_until_quiescent(&mut replicas, &[], NodeId(1), requests);
+        assert_eq!(replicas[&NodeId(1)].node().role(), Role::Leader);
+
+        let leader = replicas.get_mut(&NodeId(1)).expect("known replica");
+        leader.propose(Command::Set {
+            key: vec![1],
+            value: vec![42],
+        });
+        let get_index = leader
+            .propose(Command::Get { key: vec![1] })
+            .expect("leader accepts propose");
+
+        let heartbeat = replicas
+            .get_mut(&NodeId(1))
+            .expect("known replica")
+            .step(Event::Tick { next_timeout: 10 });
+        deliver_until_quiescent(&mut replicas, &[], NodeId(1), heartbeat);
+
+        assert_eq!(
+            replicas[&NodeId(1)].applied_result(get_index),
+            Some(&ApplyResult::Get {
+                value: Some(vec![42])
+            })
         );
     }
 }
