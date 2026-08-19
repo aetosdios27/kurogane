@@ -123,6 +123,10 @@ impl<'a> ByteReader<'a> {
         self.position += length;
         Ok(value.to_vec())
     }
+
+    fn is_at_end(&self) -> bool {
+        self.position >= self.bytes.len()
+    }
 }
 
 /// The outcome of applying one command, kept around for later retrieval —
@@ -175,6 +179,38 @@ impl StateMachine {
             },
         }
     }
+
+    /// Serializes the entire map as `u32`-length-prefixed key/value byte
+    /// strings, reusing `Command::encode`'s existing style rather than a
+    /// fourth ad hoc format. `BTreeMap`'s iteration order is already
+    /// sorted, so this is deterministic across nodes for free.
+    pub fn snapshot(&self) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        for (key, value) in &self.entries {
+            encode_bytes(&mut bytes, key);
+            encode_bytes(&mut bytes, value);
+        }
+        bytes
+    }
+
+    /// Replaces this state machine's entire map with the contents of
+    /// `bytes` (as produced by `snapshot`), and sets `last_applied` to
+    /// `last_applied` -- passed explicitly rather than embedded in the
+    /// blob, since the caller already knows it from the node's own
+    /// snapshot metadata.
+    pub fn restore(&mut self, last_applied: u64, bytes: &[u8]) -> Result<(), DecodeError> {
+        let mut reader = ByteReader::new(bytes);
+        let mut entries = BTreeMap::new();
+        while !reader.is_at_end() {
+            let key = reader.read_bytes()?;
+            let value = reader.read_bytes()?;
+            entries.insert(key, value);
+        }
+
+        self.entries = entries;
+        self.last_applied = last_applied;
+        Ok(())
+    }
 }
 
 /// Wraps a `Node`, automatically draining newly committed log entries into
@@ -188,10 +224,30 @@ pub struct Replica {
 }
 
 impl Replica {
+    /// Wraps a freshly constructed node -- just this call's degenerate
+    /// no-prior-snapshot case, the same relationship `Node::new`/
+    /// `Node::recover` already have.
     pub fn new(node: Node) -> Self {
+        Self::recover(node)
+    }
+
+    /// Reconstructs a `Replica` from a node that may already carry a
+    /// durable snapshot -- e.g. after a real process restart. Restores the
+    /// state machine from the node's own retained snapshot bytes when one
+    /// exists; a `Node::new`-built node never does, so this is safe to call
+    /// unconditionally.
+    pub fn recover(node: Node) -> Self {
+        let mut state_machine = StateMachine::new();
+        let snapshot = node.snapshot();
+        if snapshot.last_included_index > 0 {
+            state_machine
+                .restore(snapshot.last_included_index, node.snapshot_data())
+                .expect("a node's own persisted snapshot bytes are always well-formed");
+        }
+
         Self {
             node,
-            state_machine: StateMachine::new(),
+            state_machine,
             results: BTreeMap::new(),
         }
     }
@@ -227,10 +283,48 @@ impl Replica {
         effects
     }
 
+    /// Compacts everything applied so far, minus `retain`, into a snapshot
+    /// -- e.g. `retain` keeps a margin so a peer only one heartbeat behind
+    /// doesn't force a full snapshot transfer instead of an ordinary
+    /// `AppendEntries`. `None` if there's nothing new to compact (nothing
+    /// applied yet, or already compacted at least this far).
+    pub fn compact(&mut self, retain: u64) -> Option<Vec<Effect>> {
+        let up_to_index = self.state_machine.last_applied().saturating_sub(retain);
+        if up_to_index == 0 || up_to_index <= self.node.snapshot().last_included_index {
+            return None;
+        }
+
+        let data = self.state_machine.snapshot();
+        let effects = self
+            .node
+            .compact(up_to_index, data)
+            .expect("up_to_index is derived from last_applied, which never exceeds commit_index");
+        Some(effects)
+    }
+
     fn drain_committed(&mut self) {
+        // Node::compact (see `compact` above) can never move the snapshot
+        // boundary past what's already locally applied -- it only ever
+        // compacts up to last_applied. So a boundary strictly ahead of
+        // last_applied can only mean an incoming InstallSnapshot just
+        // landed via `step`, not self-compaction.
+        let snapshot_boundary = self.node.snapshot().last_included_index;
+        if snapshot_boundary > self.state_machine.last_applied() {
+            self.state_machine
+                .restore(snapshot_boundary, self.node.snapshot_data())
+                .expect("a node's own persisted snapshot bytes are always well-formed");
+            // Indices the jump skipped past have no backing log entry
+            // anymore, so any result recorded for them can never be
+            // recomputed -- drop them rather than serve stale answers.
+            self.results.retain(|&index, _| index > snapshot_boundary);
+        }
+
         while self.state_machine.last_applied() < self.node.commit_index() {
             let index = self.state_machine.last_applied() + 1;
-            let entry = &self.node.log()[(index - 1) as usize];
+            let entry = self
+                .node
+                .entry_at(index)
+                .expect("a committed index not yet applied is still held in the log");
             let command = Command::decode(&entry.command)
                 .expect("this replica only ever proposes commands it encoded itself");
             let result = self.state_machine.apply(&command);
@@ -243,7 +337,7 @@ impl Replica {
 mod tests {
     use std::collections::BTreeMap;
 
-    use kurogane_raft::{Message, Node, NodeId, Role};
+    use kurogane_raft::{AppendEntries, InstallSnapshot, LogEntry, Message, Node, NodeId, Role};
 
     use super::{ApplyResult, Command, DecodeError, Effect, Event, Replica, StateMachine};
 
@@ -398,6 +492,30 @@ mod tests {
     }
 
     #[test]
+    fn state_machine_snapshot_and_restore_round_trip() {
+        let mut state_machine = StateMachine::new();
+        state_machine.apply(&Command::Set {
+            key: vec![1],
+            value: vec![10],
+        });
+        state_machine.apply(&Command::Set {
+            key: vec![2],
+            value: vec![20],
+        });
+        state_machine.apply(&Command::Delete { key: vec![1] });
+        let bytes = state_machine.snapshot();
+
+        let mut restored = StateMachine::new();
+        restored
+            .restore(3, &bytes)
+            .expect("well-formed snapshot bytes");
+
+        assert_eq!(restored.last_applied(), 3);
+        assert_eq!(restored.get(&[1]), None);
+        assert_eq!(restored.get(&[2]), Some(&[20][..]));
+    }
+
+    #[test]
     fn propose_returns_none_when_not_leader() {
         let peers = vec![NodeId(1), NodeId(2), NodeId(3)];
         let node = Node::new(NodeId(1), peers, 5, 2).expect("valid node");
@@ -452,6 +570,133 @@ mod tests {
             replica.applied_result(1),
             Some(&ApplyResult::Set { previous: None })
         );
+    }
+
+    #[test]
+    fn replica_compact_snapshots_the_state_machine_and_advances_the_node_boundary() {
+        let node = Node::new(NodeId(1), vec![NodeId(1)], 1, 1).expect("valid node");
+        let mut replica = Replica::new(node);
+        replica.step(Event::Tick { next_timeout: 5 });
+        replica.propose(Command::Set {
+            key: vec![1],
+            value: vec![9],
+        });
+        replica.propose(Command::Set {
+            key: vec![2],
+            value: vec![8],
+        });
+        assert_eq!(replica.state_machine().last_applied(), 2);
+
+        let effects = replica
+            .compact(0)
+            .expect("2 applied entries, nothing retained");
+
+        assert!(!effects.is_empty());
+        assert_eq!(replica.node().snapshot().last_included_index, 2);
+    }
+
+    #[test]
+    fn replica_compact_returns_none_when_nothing_new_to_compact() {
+        let node = Node::new(NodeId(1), vec![NodeId(1)], 1, 1).expect("valid node");
+        let mut replica = Replica::new(node);
+
+        assert_eq!(replica.compact(0), None);
+    }
+
+    #[test]
+    fn replica_compact_respects_the_retain_margin() {
+        let node = Node::new(NodeId(1), vec![NodeId(1)], 1, 1).expect("valid node");
+        let mut replica = Replica::new(node);
+        replica.step(Event::Tick { next_timeout: 5 });
+        replica.propose(Command::Set {
+            key: vec![1],
+            value: vec![9],
+        });
+
+        // last_applied is 1; retaining 1 means up_to_index would be 0.
+        assert_eq!(replica.compact(1), None);
+    }
+
+    #[test]
+    fn replica_recover_restores_the_state_machine_from_the_nodes_own_snapshot() {
+        let mut node = Node::new(NodeId(1), vec![NodeId(1)], 1, 1).expect("valid node");
+        node.step(Event::Tick { next_timeout: 5 });
+        node.propose(
+            Command::Set {
+                key: vec![1],
+                value: vec![42],
+            }
+            .encode(),
+        );
+        assert_eq!(node.commit_index(), 1);
+
+        let mut snapshot_state = StateMachine::new();
+        snapshot_state.apply(&Command::Set {
+            key: vec![1],
+            value: vec![42],
+        });
+        node.compact(1, snapshot_state.snapshot())
+            .expect("index 1 is committed");
+
+        let replica = Replica::recover(node);
+
+        assert_eq!(replica.state_machine().get(&[1]), Some(&[42][..]));
+        assert_eq!(replica.state_machine().last_applied(), 1);
+    }
+
+    #[test]
+    fn drain_committed_detects_an_incoming_install_snapshot_and_restores_the_state_machine() {
+        let peers = vec![NodeId(1), NodeId(2), NodeId(3)];
+        let node = Node::new(NodeId(1), peers, 5, 2).expect("valid node");
+        let mut replica = Replica::new(node);
+
+        // Seed a value directly applied via ordinary replication, so we can
+        // prove the incoming install replaces state rather than merging
+        // into it.
+        replica.step(Event::Step {
+            from: NodeId(2),
+            message: Message::AppendEntries(AppendEntries {
+                term: 1,
+                leader_id: NodeId(2),
+                prev_log_index: 0,
+                prev_log_term: 0,
+                entries: vec![LogEntry {
+                    term: 1,
+                    command: Command::Set {
+                        key: vec![9],
+                        value: vec![9],
+                    }
+                    .encode(),
+                }],
+                leader_commit: 1,
+            }),
+        });
+        assert_eq!(replica.state_machine().get(&[9]), Some(&[9][..]));
+
+        let mut snapshot_state = StateMachine::new();
+        snapshot_state.apply(&Command::Set {
+            key: vec![1],
+            value: vec![100],
+        });
+        let data = snapshot_state.snapshot();
+
+        replica.step(Event::Step {
+            from: NodeId(2),
+            message: Message::InstallSnapshot(InstallSnapshot {
+                term: 1,
+                leader_id: NodeId(2),
+                last_included_index: 5,
+                last_included_term: 1,
+                data,
+            }),
+        });
+
+        assert_eq!(replica.state_machine().get(&[9]), None);
+        assert_eq!(replica.state_machine().get(&[1]), Some(&[100][..]));
+        assert_eq!(replica.state_machine().last_applied(), 5);
+        // The jump past index 1 discards any result recorded there -- it
+        // has no backing log entry anymore and can never be recomputed.
+        assert_eq!(replica.applied_result(1), None);
     }
 
     fn three_replica_cluster(
