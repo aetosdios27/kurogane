@@ -108,6 +108,16 @@ pub struct HardState {
     pub voted_for: Option<NodeId>,
 }
 
+/// Metadata about the most recent snapshot a node holds. Log indices at or
+/// before `last_included_index` have been compacted away and are no longer
+/// stored in `log`; `last_included_index == 0` (the default) means no
+/// snapshot exists yet, and every absolute index still lives in `log`.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct SnapshotMetadata {
+    pub last_included_index: u64,
+    pub last_included_term: u64,
+}
+
 /// Invalid construction of a Raft node.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ConfigError {
@@ -157,6 +167,7 @@ pub struct Node {
     commit_index: u64,
     next_index: BTreeMap<NodeId, u64>,
     match_index: BTreeMap<NodeId, u64>,
+    snapshot: SnapshotMetadata,
 }
 
 impl Node {
@@ -226,6 +237,7 @@ impl Node {
             commit_index: 0,
             next_index: BTreeMap::new(),
             match_index: BTreeMap::new(),
+            snapshot: SnapshotMetadata::default(),
         })
     }
 
@@ -270,11 +282,14 @@ impl Node {
     }
 
     pub fn last_log_index(&self) -> u64 {
-        self.log.len() as u64
+        self.snapshot.last_included_index + self.log.len() as u64
     }
 
     pub fn last_log_term(&self) -> u64 {
-        self.log.last().map(|entry| entry.term).unwrap_or(0)
+        self.log
+            .last()
+            .map(|entry| entry.term)
+            .unwrap_or(self.snapshot.last_included_term)
     }
 
     pub fn log(&self) -> &[LogEntry] {
@@ -323,11 +338,35 @@ impl Node {
         self.peers.binary_search(&id).is_ok()
     }
 
+    /// Position of absolute `index` within `log`. Callers must ensure
+    /// `index > snapshot.last_included_index` — anything at or before the
+    /// snapshot boundary has been compacted away and isn't stored here.
+    fn vec_index(&self, index: u64) -> usize {
+        (index - self.snapshot.last_included_index - 1) as usize
+    }
+
+    /// The log entry at absolute `index`, if it's still held in `log`.
+    /// `None` both for an out-of-range index and for one at or before the
+    /// snapshot boundary — compacted entries are reached through
+    /// `InstallSnapshot`, not this accessor.
+    pub fn entry_at(&self, index: u64) -> Option<&LogEntry> {
+        if index == 0 || index <= self.snapshot.last_included_index {
+            return None;
+        }
+        self.log.get(self.vec_index(index))
+    }
+
     fn term_at(&self, index: u64) -> Option<u64> {
         if index == 0 {
             return None;
         }
-        self.log.get((index - 1) as usize).map(|entry| entry.term)
+        if index == self.snapshot.last_included_index {
+            return Some(self.snapshot.last_included_term);
+        }
+        if index < self.snapshot.last_included_index {
+            return None;
+        }
+        self.entry_at(index).map(|entry| entry.term)
     }
 
     fn on_tick(&mut self, next_timeout: u64) -> Vec<Effect> {
@@ -361,20 +400,24 @@ impl Node {
             .get(&peer)
             .expect("next_index tracked for every peer while leader");
         let prev_log_index = next_index - 1;
-        let prev_log_term = if prev_log_index == 0 {
-            0
-        } else {
-            self.log[prev_log_index as usize - 1].term
-        };
+        let prev_log_term = self.term_at(prev_log_index).unwrap_or(0);
 
         AppendEntries {
             term: self.current_term,
             leader_id: self.id,
             prev_log_index,
             prev_log_term,
-            entries: self.log[next_index as usize - 1..].to_vec(),
+            entries: self.entries_from(next_index),
             leader_commit: self.commit_index,
         }
+    }
+
+    /// Absolute log indices from `index` (inclusive) to the end, as still
+    /// held in `log`. Callers must ensure `index > snapshot.last_included_index`
+    /// — anything at or before the boundary must go through `InstallSnapshot`
+    /// instead.
+    fn entries_from(&self, index: u64) -> Vec<LogEntry> {
+        self.log[self.vec_index(index)..].to_vec()
     }
 
     fn broadcast_append_entries(&self) -> Vec<Effect> {
@@ -567,7 +610,7 @@ impl Node {
             match self.term_at(index) {
                 Some(existing_term) if existing_term == entry.term => {}
                 Some(_) => {
-                    self.log.truncate((index - 1) as usize);
+                    self.log.truncate(self.vec_index(index));
                     self.log.push(entry.clone());
                     if log_changed_from.is_none() {
                         log_changed_from = Some(index);
@@ -598,7 +641,7 @@ impl Node {
         if let Some(from_index) = log_changed_from {
             effects.push(Effect::PersistLog {
                 from_index,
-                entries: self.log[(from_index - 1) as usize..].to_vec(),
+                entries: self.entries_from(from_index),
             });
         }
         effects.push(Effect::Send {
