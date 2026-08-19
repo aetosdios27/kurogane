@@ -71,17 +71,22 @@ impl PeerTransport for GrpcPeerTransport {
                         ))
                     })
                 }
+                Message::InstallSnapshot(request) => {
+                    let request = attach_token(
+                        Request::new(dto::install_snapshot_to_proto(request)),
+                        &token,
+                    );
+                    client.install_snapshot(request).await.map(|response| {
+                        Message::InstallSnapshotResponse(dto::install_snapshot_response_from_proto(
+                            response.into_inner(),
+                        ))
+                    })
+                }
                 // kurogane-raft never emits a Send carrying a *response*
                 // message -- only requests originate from Node::step.
-                // InstallSnapshot is a request, but its gRPC wiring doesn't
-                // land until a later commit; until then it's dropped like
-                // any other lost message, which the leader's own retry
-                // (the heartbeat-driven replication cycle) covers the same
-                // way it covers an unreachable peer today.
                 Message::RequestVoteResponse(_)
                 | Message::AppendEntriesResponse(_)
-                | Message::InstallSnapshotResponse(_)
-                | Message::InstallSnapshot(_) => return,
+                | Message::InstallSnapshotResponse(_) => return,
             };
 
             // A failed call (unreachable peer, timeout, stale token, ...) is
