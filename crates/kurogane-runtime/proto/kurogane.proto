@@ -39,9 +39,28 @@ message AppendEntriesReply {
   uint64 match_index = 3;
 }
 
+// Sent instead of AppendEntries once a peer's next_index has fallen at or
+// behind the leader's own compaction boundary. Single-shot, no chunking --
+// a toy-sized KV's state fits one message, and a unary call either fully
+// deserializes or errors, so there's no partial-apply risk to guard
+// against (see kurogane_raft::Message::InstallSnapshot).
+message InstallSnapshotRequest {
+  uint64 term = 1;
+  uint64 leader_id = 2;
+  uint64 last_included_index = 3;
+  uint64 last_included_term = 4;
+  bytes data = 5;
+}
+
+message InstallSnapshotReply {
+  uint64 term = 1;
+  uint64 last_included_index = 2;
+}
+
 service RaftPeer {
   rpc RequestVote(RequestVoteRequest) returns (RequestVoteReply);
   rpc AppendEntries(AppendEntriesRequest) returns (AppendEntriesReply);
+  rpc InstallSnapshot(InstallSnapshotRequest) returns (InstallSnapshotReply);
 }
 
 // Client-facing service. Command is structured here -- this is the wire

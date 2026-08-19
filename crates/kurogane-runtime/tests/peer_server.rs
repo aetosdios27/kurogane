@@ -9,9 +9,9 @@ use kurogane_kv::Replica;
 use kurogane_raft::{Message, Node, NodeId};
 use kurogane_runtime::actor::{self, Actor, PeerTransport};
 use kurogane_runtime::auth::{TokenInterceptor, attach_token};
-use kurogane_runtime::proto::RequestVoteRequest;
 use kurogane_runtime::proto::raft_peer_client::RaftPeerClient;
 use kurogane_runtime::proto::raft_peer_server::RaftPeerServer;
+use kurogane_runtime::proto::{InstallSnapshotRequest, RequestVoteRequest};
 use kurogane_runtime::server::RaftPeerService;
 use kurogane_runtime::storage::Storage;
 use tempfile::tempdir;
@@ -87,6 +87,37 @@ async fn a_request_vote_round_trips_over_a_real_socket() {
 
     assert_eq!(reply.term, 1);
     assert!(reply.granted);
+}
+
+#[tokio::test]
+async fn an_install_snapshot_round_trips_over_a_real_socket() {
+    let addr = spawn_server(NodeId(1), vec![NodeId(1), NodeId(2)]).await;
+
+    let mut client = RaftPeerClient::connect(format!("http://{addr}"))
+        .await
+        .expect("connect to the real listener");
+
+    // data must be a validly encoded kurogane_kv::StateMachine snapshot --
+    // the actor behind this socket wraps a real Replica, which decodes it.
+    // An empty snapshot (no keys) is the simplest valid one.
+    let request = attach_token(
+        Request::new(InstallSnapshotRequest {
+            term: 1,
+            leader_id: 2,
+            last_included_index: 5,
+            last_included_term: 1,
+            data: Vec::new(),
+        }),
+        TOKEN,
+    );
+    let reply = client
+        .install_snapshot(request)
+        .await
+        .expect("real RPC succeeds")
+        .into_inner();
+
+    assert_eq!(reply.term, 1);
+    assert_eq!(reply.last_included_index, 5);
 }
 
 #[tokio::test]

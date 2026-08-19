@@ -312,7 +312,10 @@ impl Replica {
         if snapshot_boundary > self.state_machine.last_applied() {
             self.state_machine
                 .restore(snapshot_boundary, self.node.snapshot_data())
-                .expect("a node's own persisted snapshot bytes are always well-formed");
+                .expect(
+                    "InstallSnapshot data always originates from another node's own \
+                     Replica::compact, so it's always well-formed",
+                );
             // Indices the jump skipped past have no backing log entry
             // anymore, so any result recorded for them can never be
             // recomputed -- drop them rather than serve stale answers.

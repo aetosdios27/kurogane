@@ -8,8 +8,9 @@ use crate::dto;
 use crate::proto::raft_client_server::RaftClient;
 use crate::proto::raft_peer_server::RaftPeer;
 use crate::proto::{
-    AppendEntriesReply, AppendEntriesRequest, NotLeader, ProposeAccepted, ProposeReply,
-    ProposeRequest, RequestVoteReply, RequestVoteRequest, propose_reply,
+    AppendEntriesReply, AppendEntriesRequest, InstallSnapshotReply, InstallSnapshotRequest,
+    NotLeader, ProposeAccepted, ProposeReply, ProposeRequest, RequestVoteReply, RequestVoteRequest,
+    propose_reply,
 };
 use kurogane_raft::Message;
 
@@ -66,6 +67,30 @@ impl RaftPeer for RaftPeerService {
         match reply {
             Message::AppendEntriesResponse(response) => Ok(Response::new(
                 dto::append_entries_response_to_proto(response),
+            )),
+            _ => Err(Status::internal(
+                "actor returned an unexpected response type",
+            )),
+        }
+    }
+
+    async fn install_snapshot(
+        &self,
+        request: Request<InstallSnapshotRequest>,
+    ) -> Result<Response<InstallSnapshotReply>, Status> {
+        let value = dto::install_snapshot_from_proto(request.into_inner());
+        let from = value.leader_id;
+
+        let reply = self
+            .actor
+            .peer_request(from, Message::InstallSnapshot(value))
+            .await
+            .ok_or_else(|| Status::unavailable("actor task is not running"))?
+            .ok_or_else(|| Status::invalid_argument("not a recognized cluster member"))?;
+
+        match reply {
+            Message::InstallSnapshotResponse(response) => Ok(Response::new(
+                dto::install_snapshot_response_to_proto(response),
             )),
             _ => Err(Status::internal(
                 "actor returned an unexpected response type",

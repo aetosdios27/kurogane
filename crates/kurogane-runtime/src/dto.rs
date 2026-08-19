@@ -7,7 +7,8 @@ use std::fmt;
 
 use kurogane_kv::Command;
 use kurogane_raft::{
-    AppendEntries, AppendEntriesResponse, LogEntry, NodeId, RequestVote, RequestVoteResponse,
+    AppendEntries, AppendEntriesResponse, InstallSnapshot, InstallSnapshotResponse, LogEntry,
+    NodeId, RequestVote, RequestVoteResponse,
 };
 
 use crate::proto;
@@ -99,6 +100,44 @@ pub fn append_entries_response_to_proto(value: AppendEntriesResponse) -> proto::
         term: value.term,
         success: value.success,
         match_index: value.match_index,
+    }
+}
+
+pub fn install_snapshot_from_proto(proto: proto::InstallSnapshotRequest) -> InstallSnapshot {
+    InstallSnapshot {
+        term: proto.term,
+        leader_id: NodeId(proto.leader_id),
+        last_included_index: proto.last_included_index,
+        last_included_term: proto.last_included_term,
+        data: proto.data,
+    }
+}
+
+pub fn install_snapshot_to_proto(value: InstallSnapshot) -> proto::InstallSnapshotRequest {
+    proto::InstallSnapshotRequest {
+        term: value.term,
+        leader_id: value.leader_id.0,
+        last_included_index: value.last_included_index,
+        last_included_term: value.last_included_term,
+        data: value.data,
+    }
+}
+
+pub fn install_snapshot_response_from_proto(
+    proto: proto::InstallSnapshotReply,
+) -> InstallSnapshotResponse {
+    InstallSnapshotResponse {
+        term: proto.term,
+        last_included_index: proto.last_included_index,
+    }
+}
+
+pub fn install_snapshot_response_to_proto(
+    value: InstallSnapshotResponse,
+) -> proto::InstallSnapshotReply {
+    proto::InstallSnapshotReply {
+        term: value.term,
+        last_included_index: value.last_included_index,
     }
 }
 
@@ -205,6 +244,35 @@ mod tests {
 
         assert_eq!(
             append_entries_response_from_proto(append_entries_response_to_proto(value)),
+            value
+        );
+    }
+
+    #[test]
+    fn round_trips_install_snapshot() {
+        let value = InstallSnapshot {
+            term: 3,
+            leader_id: NodeId(2),
+            last_included_index: 7,
+            last_included_term: 2,
+            data: vec![9, 9, 9],
+        };
+
+        assert_eq!(
+            install_snapshot_from_proto(install_snapshot_to_proto(value.clone())),
+            value
+        );
+    }
+
+    #[test]
+    fn round_trips_install_snapshot_response() {
+        let value = InstallSnapshotResponse {
+            term: 3,
+            last_included_index: 7,
+        };
+
+        assert_eq!(
+            install_snapshot_response_from_proto(install_snapshot_response_to_proto(value)),
             value
         );
     }
