@@ -347,7 +347,7 @@ impl Simulation {
 
 #[cfg(test)]
 mod tests {
-    use kurogane_raft::{Effect, HardState, LogEntry, Node, NodeId, Snapshot};
+    use kurogane_raft::{Effect, HardState, LogEntry, Node, NodeId, Snapshot, SnapshotMetadata};
 
     use super::{Cluster, ClusterError, DurableState};
 
@@ -487,6 +487,67 @@ mod tests {
         );
         assert_eq!(durable.log().len(), 2);
         assert_eq!(durable.log()[1], replacement);
+    }
+
+    #[test]
+    fn durable_state_persist_snapshot_then_persist_log_uses_the_new_boundary() {
+        let mut durable = DurableState::default();
+        durable.apply(&Effect::PersistLog {
+            from_index: 1,
+            entries: vec![
+                LogEntry {
+                    term: 1,
+                    command: vec![1],
+                },
+                LogEntry {
+                    term: 1,
+                    command: vec![2],
+                },
+                LogEntry {
+                    term: 1,
+                    command: vec![3],
+                },
+            ],
+        });
+
+        // Compacting through index 3, mirroring exactly what Node::compact
+        // emits: PersistSnapshot moves the boundary, then a PersistLog
+        // pins down what's retained above it -- here, nothing.
+        durable.apply(&Effect::PersistSnapshot {
+            last_included_index: 3,
+            last_included_term: 1,
+            data: vec![9, 9],
+        });
+        durable.apply(&Effect::PersistLog {
+            from_index: 4,
+            entries: Vec::new(),
+        });
+
+        // A later entry lands at absolute index 4 -- the first index above
+        // the new boundary, not vec position 4 counted from the old start.
+        durable.apply(&Effect::PersistLog {
+            from_index: 4,
+            entries: vec![LogEntry {
+                term: 1,
+                command: vec![4],
+            }],
+        });
+
+        assert_eq!(
+            durable.snapshot(),
+            SnapshotMetadata {
+                last_included_index: 3,
+                last_included_term: 1,
+            }
+        );
+        assert_eq!(durable.snapshot_data(), &[9, 9]);
+        assert_eq!(
+            durable.log(),
+            &[LogEntry {
+                term: 1,
+                command: vec![4]
+            }]
+        );
     }
 
     #[test]

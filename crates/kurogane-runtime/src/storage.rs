@@ -215,6 +215,79 @@ mod tests {
     }
 
     #[test]
+    fn persist_snapshot_then_persist_log_uses_the_new_boundary_for_absolute_indexing() {
+        let dir = tempdir().expect("temp dir");
+        let path = dir.path().join("state");
+
+        let mut storage = Storage::open(&path).expect("open storage");
+        storage
+            .apply(&Effect::PersistLog {
+                from_index: 1,
+                entries: vec![
+                    LogEntry {
+                        term: 1,
+                        command: vec![1],
+                    },
+                    LogEntry {
+                        term: 1,
+                        command: vec![2],
+                    },
+                    LogEntry {
+                        term: 1,
+                        command: vec![3],
+                    },
+                ],
+            })
+            .expect("persist log");
+
+        // Compacting through index 3, mirroring exactly what Node::compact
+        // emits: PersistSnapshot moves the boundary, then a PersistLog
+        // pins down what's retained above it -- here, nothing.
+        storage
+            .apply(&Effect::PersistSnapshot {
+                last_included_index: 3,
+                last_included_term: 1,
+                data: vec![9, 9],
+            })
+            .expect("persist snapshot");
+        storage
+            .apply(&Effect::PersistLog {
+                from_index: 4,
+                entries: Vec::new(),
+            })
+            .expect("persist log");
+
+        // A later entry lands at absolute index 4 -- the first index above
+        // the new boundary, not vec position 4 counted from the old start.
+        storage
+            .apply(&Effect::PersistLog {
+                from_index: 4,
+                entries: vec![LogEntry {
+                    term: 1,
+                    command: vec![4],
+                }],
+            })
+            .expect("persist log");
+
+        let reopened = Storage::open(&path).expect("reopen storage");
+        assert_eq!(
+            reopened.snapshot(),
+            SnapshotMetadata {
+                last_included_index: 3,
+                last_included_term: 1,
+            }
+        );
+        assert_eq!(reopened.snapshot_data(), &[9, 9]);
+        assert_eq!(
+            reopened.log(),
+            &[LogEntry {
+                term: 1,
+                command: vec![4]
+            }]
+        );
+    }
+
+    #[test]
     fn ignores_send_effects() {
         use kurogane_raft::{Message, RequestVoteResponse};
 

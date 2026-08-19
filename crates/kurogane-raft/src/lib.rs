@@ -1034,11 +1034,22 @@ impl Node {
         };
         self.snapshot_data = snapshot_data.clone();
 
-        Ok(vec![Effect::PersistSnapshot {
-            last_included_index: up_to_index,
-            last_included_term,
-            data: snapshot_data,
-        }])
+        Ok(vec![
+            Effect::PersistSnapshot {
+                last_included_index: up_to_index,
+                last_included_term,
+                data: snapshot_data,
+            },
+            // PersistSnapshot alone doesn't tell the owner's durable log to
+            // drop the now-redundant compacted prefix -- pin it down
+            // explicitly, same as on_install_snapshot does. entries_from
+            // reads the boundary we just updated above, so this returns
+            // exactly what's left in `log` after the drain.
+            Effect::PersistLog {
+                from_index: up_to_index + 1,
+                entries: self.entries_from(up_to_index + 1),
+            },
+        ])
     }
 
     fn step_down(&mut self, term: u64) {
@@ -2674,11 +2685,20 @@ mod tests {
 
         assert_eq!(
             effects,
-            vec![Effect::PersistSnapshot {
-                last_included_index: 2,
-                last_included_term: 1,
-                data: vec![9, 9],
-            }]
+            vec![
+                Effect::PersistSnapshot {
+                    last_included_index: 2,
+                    last_included_term: 1,
+                    data: vec![9, 9],
+                },
+                Effect::PersistLog {
+                    from_index: 3,
+                    entries: vec![LogEntry {
+                        term: 1,
+                        command: vec![3],
+                    }],
+                },
+            ]
         );
         assert_eq!(
             node.snapshot(),
@@ -2706,6 +2726,32 @@ mod tests {
                 command: vec![3]
             })
         );
+    }
+
+    #[test]
+    fn compact_through_the_entire_log_persists_an_empty_retained_suffix() {
+        let mut node = Node::new(NodeId(1), vec![NodeId(1)], 1, 1).expect("valid node");
+        node.step(Event::Tick { next_timeout: 5 });
+        node.propose(vec![1]);
+        node.propose(vec![2]);
+
+        let effects = node.compact(2, vec![9]).expect("2 is committed");
+
+        assert_eq!(
+            effects,
+            vec![
+                Effect::PersistSnapshot {
+                    last_included_index: 2,
+                    last_included_term: 1,
+                    data: vec![9],
+                },
+                Effect::PersistLog {
+                    from_index: 3,
+                    entries: Vec::new(),
+                },
+            ]
+        );
+        assert!(node.log().is_empty());
     }
 
     #[test]
