@@ -574,8 +574,9 @@ mod simulation_tests {
     use std::collections::BTreeMap;
 
     use kurogane_raft::{
-        AppendEntries, AppendEntriesResponse, Effect, Event, LogEntry, Message, Node, NodeId,
-        RequestVote, RequestVoteResponse, Role, Snapshot,
+        AppendEntries, AppendEntriesResponse, Effect, Event, InstallSnapshot,
+        InstallSnapshotResponse, LogEntry, Message, Node, NodeId, RequestVote, RequestVoteResponse,
+        Role, Snapshot, SnapshotMetadata,
     };
 
     use super::{Cluster, DurableState, Simulation};
@@ -1078,6 +1079,169 @@ mod simulation_tests {
         assert_eq!(
             cluster.node(NodeId(1)).expect("known node").commit_index(),
             3
+        );
+    }
+
+    #[test]
+    fn an_isolated_follower_catches_up_via_install_snapshot_once_the_leader_has_compacted_past_it()
+    {
+        let peers = [NodeId(1), NodeId(2), NodeId(3)];
+        let mut cluster = Cluster::new(
+            peers
+                .iter()
+                .map(|&id| Node::new(id, peers.to_vec(), 1, 1).expect("valid node"))
+                .collect(),
+        )
+        .expect("valid cluster");
+
+        // Node 1 wins term 1 uncontested; node 3 is isolated from this
+        // point on, so it never sees any of what follows until healing.
+        let requests = cluster
+            .node_mut(NodeId(1))
+            .expect("known node")
+            .step(Event::Tick { next_timeout: 10 });
+        deliver_until_quiescent(&mut cluster, &[NodeId(3)], NodeId(1), requests);
+        assert_eq!(
+            cluster.node(NodeId(1)).expect("known node").role(),
+            Role::Leader
+        );
+
+        for command in [vec![1u8], vec![2], vec![3]] {
+            cluster
+                .node_mut(NodeId(1))
+                .expect("known node")
+                .propose(command);
+        }
+        let heartbeat = cluster
+            .node_mut(NodeId(1))
+            .expect("known node")
+            .step(Event::Tick { next_timeout: 10 });
+        deliver_until_quiescent(&mut cluster, &[NodeId(3)], NodeId(1), heartbeat);
+        assert_eq!(
+            cluster.node(NodeId(1)).expect("known node").commit_index(),
+            3
+        );
+
+        // The leader compacts its entire committed log into a snapshot --
+        // node 3, still isolated, has none of this history.
+        let leader = cluster.node_mut(NodeId(1)).expect("known node");
+        leader.compact(3, vec![9, 9]).expect("3 is committed");
+        assert!(leader.log().is_empty());
+
+        // The partition heals: node 1's next heartbeat to node 3 must be
+        // an InstallSnapshot, since node 3's next_index (still 1, its
+        // initial seed from becoming leader) has fallen at or below the
+        // leader's new boundary.
+        let healing = cluster
+            .node_mut(NodeId(1))
+            .expect("known node")
+            .step(Event::Tick { next_timeout: 10 });
+        deliver_until_quiescent(&mut cluster, &[], NodeId(1), healing);
+
+        let node3 = cluster.node(NodeId(3)).expect("known node");
+        assert_eq!(
+            node3.snapshot(),
+            SnapshotMetadata {
+                last_included_index: 3,
+                last_included_term: 1,
+            }
+        );
+        assert_eq!(node3.snapshot_data(), &[9, 9]);
+        assert_eq!(node3.commit_index(), 3);
+        assert_eq!(node3.last_log_index(), 3);
+        assert!(node3.log().is_empty());
+    }
+
+    #[test]
+    fn a_delayed_or_duplicate_install_snapshot_does_not_regress_a_node_that_already_caught_up() {
+        let mut cluster = three_node_cluster(1, 1);
+
+        let requests = cluster
+            .node_mut(NodeId(1))
+            .expect("known node")
+            .step(Event::Tick { next_timeout: 10 });
+        deliver_until_quiescent(&mut cluster, &[], NodeId(1), requests);
+        assert_eq!(
+            cluster.node(NodeId(1)).expect("known node").role(),
+            Role::Leader
+        );
+
+        for command in [vec![1u8], vec![2]] {
+            cluster
+                .node_mut(NodeId(1))
+                .expect("known node")
+                .propose(command);
+        }
+        // First round replicates the entries and lets the leader see a
+        // majority ack, committing locally. Followers only learn the
+        // leader committed via leader_commit on a *later* AppendEntries,
+        // so a second round is required before node 2 is genuinely caught
+        // up (matches kurogane-kv's identical two-round pattern).
+        for _ in 0..2 {
+            let heartbeat = cluster
+                .node_mut(NodeId(1))
+                .expect("known node")
+                .step(Event::Tick { next_timeout: 10 });
+            deliver_until_quiescent(&mut cluster, &[], NodeId(1), heartbeat);
+        }
+        assert_eq!(cluster.node(NodeId(2)).expect("known node").log().len(), 2);
+        assert_eq!(
+            cluster.node(NodeId(2)).expect("known node").commit_index(),
+            2
+        );
+
+        // A stray InstallSnapshot arrives at node 2 for a point it already
+        // covers via ordinary replication (e.g. a retried/duplicated
+        // message) -- it must be a no-op, not a regression.
+        let node2_log_before = cluster.node(NodeId(2)).expect("known node").log().to_vec();
+        let effects = cluster
+            .node_mut(NodeId(2))
+            .expect("known node")
+            .step(Event::Step {
+                from: NodeId(1),
+                message: Message::InstallSnapshot(InstallSnapshot {
+                    term: 1,
+                    leader_id: NodeId(1),
+                    last_included_index: 1,
+                    last_included_term: 1,
+                    data: vec![0xFF],
+                }),
+            });
+
+        let node2 = cluster.node(NodeId(2)).expect("known node");
+        assert_eq!(node2.log(), node2_log_before.as_slice());
+        assert_eq!(node2.commit_index(), 2);
+        assert_eq!(node2.snapshot(), SnapshotMetadata::default());
+        assert_eq!(
+            effects,
+            vec![Effect::Send {
+                to: NodeId(1),
+                message: Message::InstallSnapshotResponse(InstallSnapshotResponse {
+                    term: 1,
+                    last_included_index: 1,
+                }),
+            }]
+        );
+
+        // The cluster still converges normally afterward -- the no-op
+        // didn't leave anything in a broken state.
+        cluster
+            .node_mut(NodeId(1))
+            .expect("known node")
+            .propose(vec![3]);
+        let final_heartbeat = cluster
+            .node_mut(NodeId(1))
+            .expect("known node")
+            .step(Event::Tick { next_timeout: 10 });
+        deliver_until_quiescent(&mut cluster, &[], NodeId(1), final_heartbeat);
+
+        assert_eq!(
+            cluster.node(NodeId(1)).expect("known node").commit_index(),
+            3
+        );
+        assert_eq!(
+            cluster.node(NodeId(2)).expect("known node").log(),
+            cluster.node(NodeId(1)).expect("known node").log()
         );
     }
 
