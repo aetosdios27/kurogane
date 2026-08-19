@@ -487,26 +487,46 @@ impl Node {
         }
 
         self.heartbeat_elapsed = 0;
-        self.broadcast_append_entries()
+        self.broadcast_replication()
     }
 
-    /// Builds the `AppendEntries` this node, as leader, owes `peer` right now:
-    /// a heartbeat when `peer` is fully caught up, real entries otherwise.
-    fn append_entries_for(&self, peer: NodeId) -> AppendEntries {
+    /// Builds the `Effect::Send` this node, as leader, owes `peer` right
+    /// now: an `AppendEntries` (a heartbeat when `peer` is fully caught up,
+    /// real entries otherwise) when `peer`'s `next_index` is still covered
+    /// by `log`, or an `InstallSnapshot` when it isn't — the entries `peer`
+    /// needs have already been compacted away.
+    fn replicate_to(&self, peer: NodeId) -> Effect {
         let next_index = *self
             .next_index
             .get(&peer)
             .expect("next_index tracked for every peer while leader");
+
+        if next_index <= self.snapshot.last_included_index {
+            return Effect::Send {
+                to: peer,
+                message: Message::InstallSnapshot(InstallSnapshot {
+                    term: self.current_term,
+                    leader_id: self.id,
+                    last_included_index: self.snapshot.last_included_index,
+                    last_included_term: self.snapshot.last_included_term,
+                    data: self.snapshot_data.clone(),
+                }),
+            };
+        }
+
         let prev_log_index = next_index - 1;
         let prev_log_term = self.term_at(prev_log_index).unwrap_or(0);
 
-        AppendEntries {
-            term: self.current_term,
-            leader_id: self.id,
-            prev_log_index,
-            prev_log_term,
-            entries: self.entries_from(next_index),
-            leader_commit: self.commit_index,
+        Effect::Send {
+            to: peer,
+            message: Message::AppendEntries(AppendEntries {
+                term: self.current_term,
+                leader_id: self.id,
+                prev_log_index,
+                prev_log_term,
+                entries: self.entries_from(next_index),
+                leader_commit: self.commit_index,
+            }),
         }
     }
 
@@ -518,22 +538,22 @@ impl Node {
         self.log[self.vec_index(index)..].to_vec()
     }
 
-    fn broadcast_append_entries(&self) -> Vec<Effect> {
+    fn broadcast_replication(&self) -> Vec<Effect> {
         self.peers
             .iter()
             .copied()
             .filter(|&peer| peer != self.id)
-            .map(|peer| Effect::Send {
-                to: peer,
-                message: Message::AppendEntries(self.append_entries_for(peer)),
-            })
+            .map(|peer| self.replicate_to(peer))
             .collect()
     }
 
     /// Transitions this node to `Leader`, (re)seeding per-peer replication
-    /// state, and returns the immediate `AppendEntries` round that
-    /// establishes its authority right away rather than waiting for the next
-    /// heartbeat tick.
+    /// state, and returns the immediate replication round that establishes
+    /// its authority right away rather than waiting for the next heartbeat
+    /// tick. Always an `AppendEntries` round at this exact point — every
+    /// peer's `next_index` is freshly seeded to `last_log_index() + 1`,
+    /// strictly above the snapshot boundary — but a later back-off on
+    /// conflict can still push it down to `InstallSnapshot` territory.
     fn become_leader(&mut self) -> Vec<Effect> {
         self.role = Role::Leader;
         self.heartbeat_elapsed = 0;
@@ -546,7 +566,7 @@ impl Node {
             self.match_index.insert(peer, 0);
         }
 
-        self.broadcast_append_entries()
+        self.broadcast_replication()
     }
 
     fn start_election(&mut self, next_timeout: u64) -> Vec<Effect> {
@@ -874,10 +894,7 @@ impl Node {
             .get(&from)
             .expect("next_index tracked for every peer while leader");
         if next_index <= self.last_log_index() {
-            vec![Effect::Send {
-                to: from,
-                message: Message::AppendEntries(self.append_entries_for(from)),
-            }]
+            vec![self.replicate_to(from)]
         } else {
             Vec::new()
         }
@@ -923,10 +940,7 @@ impl Node {
             .get(&from)
             .expect("next_index tracked for every peer while leader");
         if next_index <= self.last_log_index() {
-            vec![Effect::Send {
-                to: from,
-                message: Message::AppendEntries(self.append_entries_for(from)),
-            }]
+            vec![self.replicate_to(from)]
         } else {
             Vec::new()
         }
@@ -2842,6 +2856,59 @@ mod tests {
                     leader_commit: 0,
                 }),
             }]
+        );
+    }
+
+    #[test]
+    fn leader_sends_install_snapshot_instead_of_append_entries_once_a_peers_next_index_falls_to_or_below_the_boundary()
+     {
+        let mut node = established_leader();
+        node.propose(vec![1]);
+        node.propose(vec![2]);
+        node.propose(vec![3]);
+
+        // node2 acks all three entries; node3 never has -- its next_index
+        // stays at the initial seed of 1 from becoming leader with an
+        // empty log.
+        node.step(Event::Step {
+            from: NodeId(2),
+            message: Message::AppendEntriesResponse(AppendEntriesResponse {
+                term: 1,
+                success: true,
+                match_index: 3,
+            }),
+        });
+        assert_eq!(node.commit_index(), 3);
+
+        node.compact(3, vec![9, 9]).expect("index 3 is committed");
+
+        let effects = node.step(Event::Tick { next_timeout: 5 });
+
+        assert_eq!(
+            effects,
+            vec![
+                Effect::Send {
+                    to: NodeId(2),
+                    message: Message::AppendEntries(AppendEntries {
+                        term: 1,
+                        leader_id: NodeId(1),
+                        prev_log_index: 3,
+                        prev_log_term: 1,
+                        entries: Vec::new(),
+                        leader_commit: 3,
+                    }),
+                },
+                Effect::Send {
+                    to: NodeId(3),
+                    message: Message::InstallSnapshot(InstallSnapshot {
+                        term: 1,
+                        leader_id: NodeId(1),
+                        last_included_index: 3,
+                        last_included_term: 1,
+                        data: vec![9, 9],
+                    }),
+                },
+            ]
         );
     }
 
