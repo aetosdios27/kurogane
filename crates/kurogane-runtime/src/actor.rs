@@ -38,15 +38,20 @@ pub struct Actor<T: PeerTransport> {
     storage: Storage,
     transport: T,
     leader_hint: Option<NodeId>,
+    /// Triggers compaction once this many entries have been applied since
+    /// the last one. Kept deliberately small in tests to force real
+    /// compaction without needing hundreds of writes.
+    compact_threshold: u64,
 }
 
 impl<T: PeerTransport> Actor<T> {
-    pub fn new(replica: Replica, storage: Storage, transport: T) -> Self {
+    pub fn new(replica: Replica, storage: Storage, transport: T, compact_threshold: u64) -> Self {
         Self {
             replica,
             storage,
             transport,
             leader_hint: None,
+            compact_threshold,
         }
     }
 
@@ -80,7 +85,8 @@ impl<T: PeerTransport> Actor<T> {
             self.update_leader_hint(*from, message);
         }
         let effects = self.replica.step(event);
-        self.dispatch(effects)
+        self.dispatch(effects)?;
+        self.maybe_compact()
     }
 
     /// For an incoming peer *request* (`RequestVote`/`AppendEntries`)
@@ -120,6 +126,7 @@ impl<T: PeerTransport> Actor<T> {
                 self.storage.apply(effect)?;
             }
         }
+        self.maybe_compact()?;
         Ok(Some(reply))
     }
 
@@ -131,19 +138,43 @@ impl<T: PeerTransport> Actor<T> {
             return Ok(ProposeOutcome::NotLeader(self.leader_hint));
         };
         self.dispatch(effects)?;
+        self.maybe_compact()?;
         Ok(ProposeOutcome::Accepted(index))
     }
 
     fn update_leader_hint(&mut self, from: NodeId, message: &Message) {
-        let Message::AppendEntries(request) = message else {
-            return;
+        // Both a real AppendEntries and an InstallSnapshot are equally
+        // good evidence of who's leading; mirrors on_append_entries's own
+        // stale-term rejection: a request that would itself be rejected
+        // tells us nothing about who's actually leading right now.
+        let (leader_id, term) = match message {
+            Message::AppendEntries(request) => (request.leader_id, request.term),
+            Message::InstallSnapshot(request) => (request.leader_id, request.term),
+            _ => return,
         };
-        // Mirrors on_append_entries's own stale-term rejection: a request
-        // that would be rejected tells us nothing about who's actually
-        // leading right now.
-        if request.leader_id == from && request.term >= self.replica.node().current_term() {
-            self.leader_hint = Some(request.leader_id);
+        if leader_id == from && term >= self.replica.node().current_term() {
+            self.leader_hint = Some(leader_id);
         }
+    }
+
+    /// Compacts once at least `compact_threshold` entries have been
+    /// applied since the last compaction, retaining half that margin so a
+    /// peer only briefly behind still catches up via an ordinary
+    /// `AppendEntries` instead of a full snapshot transfer. Retaining
+    /// strictly less than the threshold is load-bearing: retaining at
+    /// least as much as the trigger threshold would mean `up_to_index`
+    /// never clears the current boundary, and compaction would silently
+    /// never advance.
+    fn maybe_compact(&mut self) -> io::Result<()> {
+        let applied_since_boundary = self.replica.state_machine().last_applied()
+            - self.replica.node().snapshot().last_included_index;
+        if applied_since_boundary < self.compact_threshold {
+            return Ok(());
+        }
+        if let Some(effects) = self.replica.compact(self.compact_threshold / 2) {
+            self.dispatch(effects)?;
+        }
+        Ok(())
     }
 
     fn dispatch(&mut self, effects: Vec<Effect>) -> io::Result<()> {
@@ -327,7 +358,14 @@ mod tests {
         // these are short-lived unit tests, not a long-running process.
         let path = Box::leak(Box::new(dir)).path().join("state");
         let storage = Storage::open(path).expect("open storage");
-        Actor::new(Replica::new(node), storage, RecordingTransport::new())
+        // Effectively disables compaction: nothing in these short-lived
+        // unit tests applies anywhere near this many entries.
+        Actor::new(
+            Replica::new(node),
+            storage,
+            RecordingTransport::new(),
+            u64::MAX,
+        )
     }
 
     #[test]
@@ -389,6 +427,41 @@ mod tests {
             Some(&ApplyResult::Set { previous: None })
         );
         assert_eq!(actor.state_machine().get(&[1]), Some(&[9][..]));
+    }
+
+    #[test]
+    fn maybe_compact_fires_once_the_threshold_is_crossed_and_persists_the_snapshot() {
+        let node =
+            kurogane_raft::Node::new(RaftNodeId(1), vec![RaftNodeId(1)], 1, 1).expect("valid node");
+        let dir = tempdir().expect("temp dir");
+        let path = dir.path().join("state");
+        let storage = Storage::open(&path).expect("open storage");
+        let mut actor = Actor::new(Replica::new(node), storage, RecordingTransport::new(), 2);
+
+        actor
+            .handle_event(Event::Tick { next_timeout: 5 })
+            .expect("handle event");
+        assert_eq!(actor.node().role(), kurogane_raft::Role::Leader);
+
+        for key in 0..3u8 {
+            actor
+                .propose(Command::Set {
+                    key: vec![key],
+                    value: vec![key],
+                })
+                .expect("propose");
+        }
+
+        let boundary = actor.node().snapshot().last_included_index;
+        assert!(boundary > 0, "compaction should have fired by now");
+
+        let reopened = Storage::open(&path).expect("reopen storage");
+        assert_eq!(reopened.snapshot().last_included_index, boundary);
+        assert_eq!(reopened.snapshot_data(), actor.node().snapshot_data());
+        // The full path (compact -> dispatch -> Storage::apply) must still
+        // leave the log's absolute indexing correct above the boundary,
+        // not just the snapshot fields.
+        assert_eq!(reopened.log().len() as u64, 3 - boundary);
     }
 
     #[test]
@@ -474,7 +547,12 @@ mod tests {
         let path = dir.path().join("state");
         let node = kurogane_raft::Node::new(RaftNodeId(1), peers, 5, 2).expect("valid node");
         let storage = Storage::open(&path).expect("open storage");
-        let mut actor = Actor::new(Replica::new(node), storage, RecordingTransport::new());
+        let mut actor = Actor::new(
+            Replica::new(node),
+            storage,
+            RecordingTransport::new(),
+            u64::MAX,
+        );
 
         actor
             .handle_event(Event::Step {

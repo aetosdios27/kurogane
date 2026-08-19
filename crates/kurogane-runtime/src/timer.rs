@@ -41,7 +41,7 @@ mod tests {
         let node = Node::new(NodeId(1), vec![NodeId(1)], 3, 1).expect("valid node");
         let dir = tempdir().expect("temp dir");
         let storage = Storage::open(dir.path().join("state")).expect("open storage");
-        let actor = Actor::new(Replica::new(node), storage, NoopTransport);
+        let actor = Actor::new(Replica::new(node), storage, NoopTransport, u64::MAX);
         let (handle, receiver) = actor::channel(8);
         tokio::spawn(actor::run(actor, receiver));
         tokio::spawn(run(handle.clone(), Duration::from_millis(10), 5, 5));

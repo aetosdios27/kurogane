@@ -75,6 +75,7 @@ async fn main() {
     let election_timeout_ticks: u64 = env_var_or("KUROGANE_ELECTION_TIMEOUT_TICKS", 10);
     let heartbeat_interval_ticks: u64 = env_var_or("KUROGANE_HEARTBEAT_INTERVAL_TICKS", 2);
     let tick_interval_ms: u64 = env_var_or("KUROGANE_TICK_INTERVAL_MS", 50);
+    let compact_threshold: u64 = env_var_or("KUROGANE_COMPACT_THRESHOLD", 50);
 
     let storage = Storage::open(storage_path).expect("open durable storage");
     let node = Node::recover(
@@ -100,7 +101,12 @@ async fn main() {
         .collect();
     let transport = GrpcPeerTransport::new(peer_addresses, token.clone(), handle.clone());
 
-    let actor = Actor::new(Replica::new(node), storage, transport);
+    let actor = Actor::new(
+        Replica::recover(node),
+        storage,
+        transport,
+        compact_threshold,
+    );
     tokio::spawn(actor::run(actor, receiver));
 
     tokio::spawn(timer::run(

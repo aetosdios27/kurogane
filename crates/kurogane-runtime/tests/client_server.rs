@@ -34,7 +34,7 @@ async fn spawn_server(id: NodeId, peers: Vec<NodeId>) -> SocketAddr {
     // this is a short-lived test process, not a long-running one.
     let storage_path = Box::leak(Box::new(dir)).path().join("state");
     let storage = Storage::open(storage_path).expect("open storage");
-    let actor = Actor::new(Replica::new(node), storage, NoopTransport);
+    let actor = Actor::new(Replica::new(node), storage, NoopTransport, u64::MAX);
     let (handle, receiver) = actor::channel(32);
     tokio::spawn(actor::run(actor, receiver));
 
