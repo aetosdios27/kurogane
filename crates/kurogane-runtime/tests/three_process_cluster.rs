@@ -13,7 +13,7 @@ use std::net::TcpListener;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
-use kurogane_kv::StateMachine;
+use kurogane_kv::{Command as KvCommand, StateMachine};
 use kurogane_runtime::proto::raft_client_client::RaftClientClient;
 use kurogane_runtime::proto::{Command as ProtoCommand, ProposeRequest, SetCommand, propose_reply};
 use kurogane_runtime::storage::Storage;
@@ -324,29 +324,48 @@ async fn a_stopped_follower_recovers_via_install_snapshot_after_the_leader_compa
     // commit/apply/compact all 21 writes, and the follower still needs to
     // reconnect and receive the resulting snapshot, both of which can take
     // longer than any fixed guess under CI/parallel-test load.
+    // The compaction trigger deliberately retains a trailing margin of the
+    // leader's most recent entries out of the snapshot boundary, so a
+    // briefly-behind peer can still catch up via ordinary AppendEntries --
+    // meaning k18/k19 only land on the restarted follower through
+    // replication *after* the snapshot install, not inside the snapshot
+    // blob itself. Checking the blob alone is a race; the retained log
+    // suffix (recovered.log()) has to be replayed on top of it too, and the
+    // whole check has to stay inside the poll loop rather than a one-shot
+    // break after the boundary first appears.
     let poll_deadline = Instant::now() + Duration::from_secs(15);
-    let (boundary, recovered) = loop {
+    loop {
         let recovered = Storage::open(&storage_paths[&follower_id])
             .expect("reopen the restarted follower's storage");
         let boundary = recovered.snapshot().last_included_index;
         if boundary > 0 {
-            break (boundary, recovered);
+            let mut state = StateMachine::new();
+            state
+                .restore(boundary, recovered.snapshot_data())
+                .expect("the installed snapshot is well-formed");
+            // The snapshot blob already reflects every key applied as of
+            // the leader's snapshot instant, which is above `boundary` by
+            // the retain margin, so this replay re-applies some entries
+            // already present in the restored map. Harmless here (every
+            // command is a Set on a distinct key, so reapplication is
+            // idempotent) and not commit-index-gated (Storage doesn't
+            // expose one) -- both fine for this single-sequential-writer
+            // test, not a general guarantee.
+            for entry in recovered.log() {
+                let command = KvCommand::decode(&entry.command)
+                    .expect("this test only ever proposes commands it encoded itself");
+                state.apply(&command);
+            }
+            if state.get(b"k19") == Some(&b"v19"[..]) {
+                break;
+            }
         }
         assert!(
             Instant::now() < poll_deadline,
-            "restarted follower should have installed a real snapshot, not just replayed history \
-             (its log alone can't explain catch-up, since the leader compacted those entries away)"
+            "restarted follower should have installed a real snapshot and caught up on the \
+             trailing entries via replication, not just replayed history (its log alone can't \
+             explain catch-up, since the leader compacted those entries away)"
         );
         tokio::time::sleep(Duration::from_millis(100)).await;
-    };
-
-    let mut state = StateMachine::new();
-    state
-        .restore(boundary, recovered.snapshot_data())
-        .expect("the installed snapshot is well-formed");
-    assert_eq!(
-        state.get(b"k19"),
-        Some(&b"v19"[..]),
-        "the installed snapshot must reflect writes made after the follower was stopped"
-    );
+    }
 }
