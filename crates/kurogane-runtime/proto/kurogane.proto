@@ -95,12 +95,17 @@ service RaftClient {
 
 // On-disk durable state. Not part of any RPC -- reused here rather than
 // hand-rolling a third encoding, since this crate already depends on prost
-// for the wire protocol. Rewritten and fsynced whole on every write; no WAL,
-// checksums, or compaction yet (Milestone 7 territory once snapshots force
-// the question).
+// for the wire protocol. Rewritten and fsynced whole on every write; no WAL
+// or checksums, and snapshot bytes are inlined here rather than in their own
+// file -- both are accepted simplifications for a toy-sized KV, not
+// unsolved problems (see the project wiki's open questions for the tradeoff
+// as snapshots grow).
 message StorageState {
   uint64 current_term = 1;
   optional uint64 voted_for = 2;
   repeated LogEntry log = 3;
+  uint64 snapshot_last_included_index = 4;
+  uint64 snapshot_last_included_term = 5;
+  bytes snapshot_data = 6;
 }
 

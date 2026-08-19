@@ -4,7 +4,9 @@ use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt;
 
-use kurogane_raft::{Effect, Event, HardState, LogEntry, Message, Node, NodeId, Role};
+use kurogane_raft::{
+    Effect, Event, HardState, LogEntry, Message, Node, NodeId, Role, SnapshotMetadata,
+};
 
 /// Invalid construction of a deterministic cluster.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -114,14 +116,16 @@ impl Cluster {
     }
 }
 
-/// One node's simulated durable storage: whatever `HardState`/log entries
-/// have actually been confirmed via `Persist*` effects. A crash discards
-/// everything else — reconstructing a node from a `DurableState` is exactly
-/// what a real restart-from-disk would see.
+/// One node's simulated durable storage: whatever `HardState`/log/snapshot
+/// data have actually been confirmed via `Persist*` effects. A crash
+/// discards everything else — reconstructing a node from a `DurableState` is
+/// exactly what a real restart-from-disk would see.
 #[derive(Clone, Debug, Default)]
 pub struct DurableState {
     hard_state: HardState,
     log: Vec<LogEntry>,
+    snapshot: SnapshotMetadata,
+    snapshot_data: Vec<u8>,
 }
 
 impl DurableState {
@@ -131,6 +135,14 @@ impl DurableState {
 
     pub fn log(&self) -> &[LogEntry] {
         &self.log
+    }
+
+    pub fn snapshot(&self) -> SnapshotMetadata {
+        self.snapshot
+    }
+
+    pub fn snapshot_data(&self) -> &[u8] {
+        &self.snapshot_data
     }
 
     /// Records one effect as durably written. `Send` is not persistence and
@@ -147,8 +159,23 @@ impl DurableState {
                 from_index,
                 entries,
             } => {
-                self.log.truncate((*from_index - 1) as usize);
+                // `from_index` is an absolute log index; `log[0]` holds
+                // whatever comes right after the current snapshot boundary,
+                // not necessarily absolute index 1.
+                self.log
+                    .truncate((*from_index - self.snapshot.last_included_index - 1) as usize);
                 self.log.extend(entries.iter().cloned());
+            }
+            Effect::PersistSnapshot {
+                last_included_index,
+                last_included_term,
+                data,
+            } => {
+                self.snapshot = SnapshotMetadata {
+                    last_included_index: *last_included_index,
+                    last_included_term: *last_included_term,
+                };
+                self.snapshot_data = data.clone();
             }
             Effect::Send { .. } => {}
         }
@@ -320,7 +347,7 @@ impl Simulation {
 
 #[cfg(test)]
 mod tests {
-    use kurogane_raft::{Effect, HardState, LogEntry, Node, NodeId};
+    use kurogane_raft::{Effect, HardState, LogEntry, Node, NodeId, Snapshot};
 
     use super::{Cluster, ClusterError, DurableState};
 
@@ -389,6 +416,7 @@ mod tests {
                 voted_for: Some(NodeId(2)),
             },
             Vec::new(),
+            Snapshot::default(),
         )
         .expect("valid node");
         cluster.replace_node(recovered);
@@ -486,7 +514,7 @@ mod simulation_tests {
 
     use kurogane_raft::{
         AppendEntries, AppendEntriesResponse, Effect, Event, LogEntry, Message, Node, NodeId,
-        RequestVote, RequestVoteResponse, Role,
+        RequestVote, RequestVoteResponse, Role, Snapshot,
     };
 
     use super::{Cluster, DurableState, Simulation};
@@ -1146,6 +1174,10 @@ mod simulation_tests {
             2,
             durable.hard_state(),
             durable.log().to_vec(),
+            Snapshot {
+                metadata: durable.snapshot(),
+                data: durable.snapshot_data().to_vec(),
+            },
         )
         .expect("valid node");
         assert_eq!(recovered.role(), Role::Follower);
@@ -1206,6 +1238,10 @@ mod simulation_tests {
             2,
             durable.hard_state(),
             durable.log().to_vec(),
+            Snapshot {
+                metadata: durable.snapshot(),
+                data: durable.snapshot_data().to_vec(),
+            },
         )
         .expect("valid node");
 
@@ -1254,6 +1290,10 @@ mod simulation_tests {
             1,
             durable.hard_state(),
             durable.log().to_vec(),
+            Snapshot {
+                metadata: durable.snapshot(),
+                data: durable.snapshot_data().to_vec(),
+            },
         )
         .expect("valid node");
 

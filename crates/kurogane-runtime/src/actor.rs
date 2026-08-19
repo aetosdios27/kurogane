@@ -113,7 +113,10 @@ impl<T: PeerTransport> Actor<T> {
             ),
         };
         for effect in &effects {
-            if let Effect::PersistHardState { .. } | Effect::PersistLog { .. } = effect {
+            if let Effect::PersistHardState { .. }
+            | Effect::PersistLog { .. }
+            | Effect::PersistSnapshot { .. } = effect
+            {
                 self.storage.apply(effect)?;
             }
         }
@@ -146,7 +149,9 @@ impl<T: PeerTransport> Actor<T> {
     fn dispatch(&mut self, effects: Vec<Effect>) -> io::Result<()> {
         for effect in &effects {
             match effect {
-                Effect::PersistHardState { .. } | Effect::PersistLog { .. } => {
+                Effect::PersistHardState { .. }
+                | Effect::PersistLog { .. }
+                | Effect::PersistSnapshot { .. } => {
                     self.storage.apply(effect)?;
                 }
                 Effect::Send { to, message } => {

@@ -10,7 +10,7 @@ use std::net::SocketAddr;
 use std::time::Duration;
 
 use kurogane_kv::Replica;
-use kurogane_raft::{Node, NodeId};
+use kurogane_raft::{Node, NodeId, Snapshot};
 use kurogane_runtime::actor::{self, Actor};
 use kurogane_runtime::auth::TokenInterceptor;
 use kurogane_runtime::peer_client::GrpcPeerTransport;
@@ -84,6 +84,10 @@ async fn main() {
         heartbeat_interval_ticks,
         storage.hard_state(),
         storage.log().to_vec(),
+        Snapshot {
+            metadata: storage.snapshot(),
+            data: storage.snapshot_data().to_vec(),
+        },
     )
     .expect("valid node configuration");
 

@@ -4,28 +4,30 @@ use std::fs;
 use std::io::{self, Write};
 use std::path::PathBuf;
 
-use kurogane_raft::{Effect, HardState, LogEntry, NodeId};
+use kurogane_raft::{Effect, HardState, LogEntry, NodeId, SnapshotMetadata};
 use prost::Message;
 
 use crate::dto::{log_entry_from_proto, log_entry_to_proto};
 use crate::proto;
 
-/// One node's durable storage: a single file holding hard state and the
-/// full log, rewritten and fsynced on every `Persist*` effect. No WAL,
-/// checksums, or compaction yet — a synchronous write+flush is what the
-/// declared crash model actually requires, not more than that.
+/// One node's durable storage: a single file holding hard state, log, and
+/// snapshot, rewritten and fsynced on every `Persist*` effect. No WAL or
+/// checksums — a synchronous write+flush is what the declared crash model
+/// actually requires, not more than that.
 pub struct Storage {
     path: PathBuf,
     hard_state: HardState,
     log: Vec<LogEntry>,
+    snapshot: SnapshotMetadata,
+    snapshot_data: Vec<u8>,
 }
 
 impl Storage {
     /// Opens (or initializes) durable storage at `path`. A missing file
-    /// means a fresh node: default hard state, empty log.
+    /// means a fresh node: default hard state, empty log, no snapshot.
     pub fn open(path: impl Into<PathBuf>) -> io::Result<Self> {
         let path = path.into();
-        let (hard_state, log) = match fs::read(&path) {
+        let (hard_state, log, snapshot, snapshot_data) = match fs::read(&path) {
             Ok(bytes) => {
                 let record = proto::StorageState::decode(bytes.as_slice())
                     .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
@@ -35,11 +37,19 @@ impl Storage {
                         voted_for: record.voted_for.map(NodeId),
                     },
                     record.log.into_iter().map(log_entry_from_proto).collect(),
+                    SnapshotMetadata {
+                        last_included_index: record.snapshot_last_included_index,
+                        last_included_term: record.snapshot_last_included_term,
+                    },
+                    record.snapshot_data,
                 )
             }
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                (HardState::default(), Vec::new())
-            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => (
+                HardState::default(),
+                Vec::new(),
+                SnapshotMetadata::default(),
+                Vec::new(),
+            ),
             Err(error) => return Err(error),
         };
 
@@ -47,6 +57,8 @@ impl Storage {
             path,
             hard_state,
             log,
+            snapshot,
+            snapshot_data,
         })
     }
 
@@ -56,6 +68,14 @@ impl Storage {
 
     pub fn log(&self) -> &[LogEntry] {
         &self.log
+    }
+
+    pub fn snapshot(&self) -> SnapshotMetadata {
+        self.snapshot
+    }
+
+    pub fn snapshot_data(&self) -> &[u8] {
+        &self.snapshot_data
     }
 
     /// Records one effect as durable, synchronously. `Send` is not
@@ -75,8 +95,24 @@ impl Storage {
                 from_index,
                 entries,
             } => {
-                self.log.truncate((*from_index - 1) as usize);
+                // `from_index` is an absolute log index; `log[0]` holds
+                // whatever comes right after the current snapshot boundary,
+                // not necessarily absolute index 1.
+                self.log
+                    .truncate((*from_index - self.snapshot.last_included_index - 1) as usize);
                 self.log.extend(entries.iter().cloned());
+                self.flush()
+            }
+            Effect::PersistSnapshot {
+                last_included_index,
+                last_included_term,
+                data,
+            } => {
+                self.snapshot = SnapshotMetadata {
+                    last_included_index: *last_included_index,
+                    last_included_term: *last_included_term,
+                };
+                self.snapshot_data = data.clone();
                 self.flush()
             }
             Effect::Send { .. } => Ok(()),
@@ -88,6 +124,9 @@ impl Storage {
             current_term: self.hard_state.current_term,
             voted_for: self.hard_state.voted_for.map(|id| id.0),
             log: self.log.iter().cloned().map(log_entry_to_proto).collect(),
+            snapshot_last_included_index: self.snapshot.last_included_index,
+            snapshot_last_included_term: self.snapshot.last_included_term,
+            snapshot_data: self.snapshot_data.clone(),
         };
 
         let mut file = fs::File::create(&self.path)?;

@@ -89,12 +89,26 @@ pub enum Effect {
         term: u64,
         voted_for: Option<NodeId>,
     },
-    /// Splice: the durable log should be truncated to `from_index - 1`
-    /// entries, then have `entries` appended. Same before-any-dependent-Send
-    /// ordering guarantee as `PersistHardState`.
+    /// Splice: the durable log should discard every entry at or after
+    /// `from_index`, then have `entries` appended in its place. Same
+    /// before-any-dependent-Send ordering guarantee as `PersistHardState`.
     PersistLog {
         from_index: u64,
         entries: Vec<LogEntry>,
+    },
+    /// Replaces the durable snapshot: `data` (opaque to this crate — see
+    /// `LogEntry.command`'s identical treatment) becomes the new snapshot
+    /// bytes, and every log entry at or before `last_included_index`
+    /// becomes stale, since it's now represented by the snapshot instead.
+    /// This effect alone does not fully describe post-compaction log state
+    /// (a real installation may also need to retain or discard a suffix
+    /// above the boundary) — it is always immediately followed by a
+    /// `PersistLog` in the same batch that pins down exactly what remains.
+    /// Same before-any-dependent-Send ordering guarantee as the others.
+    PersistSnapshot {
+        last_included_index: u64,
+        last_included_term: u64,
+        data: Vec<u8>,
     },
 }
 
@@ -116,6 +130,16 @@ pub struct HardState {
 pub struct SnapshotMetadata {
     pub last_included_index: u64,
     pub last_included_term: u64,
+}
+
+/// A snapshot boundary paired with its opaque bytes. Only exists as a
+/// grouping for `Node::recover`'s parameter list (mirroring `HardState`
+/// pairing term/vote) — `Node` itself keeps the two as separate fields, and
+/// `snapshot()`/`snapshot_data()` return them separately too.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct Snapshot {
+    pub metadata: SnapshotMetadata,
+    pub data: Vec<u8>,
 }
 
 /// Invalid construction of a Raft node.
@@ -150,6 +174,26 @@ impl fmt::Display for ConfigError {
 
 impl Error for ConfigError {}
 
+/// Invalid compaction request.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CompactError {
+    /// `up_to_index` is past `commit_index` — compacting it would discard
+    /// state no majority has actually agreed on yet.
+    IndexNotCommitted,
+}
+
+impl fmt::Display for CompactError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let message = match self {
+            Self::IndexNotCommitted => "cannot compact past the commit index",
+        };
+
+        formatter.write_str(message)
+    }
+}
+
+impl Error for CompactError {}
+
 /// All mutable protocol state owned by one Raft node.
 #[derive(Debug)]
 pub struct Node {
@@ -168,6 +212,9 @@ pub struct Node {
     next_index: BTreeMap<NodeId, u64>,
     match_index: BTreeMap<NodeId, u64>,
     snapshot: SnapshotMetadata,
+    /// Opaque bytes for `snapshot`, kept around so a leader can resend them
+    /// via `InstallSnapshot` without asking its owner for them again.
+    snapshot_data: Vec<u8>,
 }
 
 impl Node {
@@ -187,14 +234,19 @@ impl Node {
             heartbeat_interval,
             HardState::default(),
             Vec::new(),
+            Snapshot::default(),
         )
     }
 
-    /// Reconstructs a node from durably persisted hard state and log after a
-    /// simulated crash. Always returns a `Follower` — role is not persistent
-    /// state, so a recovered node must win a fresh election to lead again —
-    /// and `commit_index` always starts at zero, since it isn't persistent
-    /// state either and is safely re-derived through normal replication.
+    /// Reconstructs a node from durably persisted hard state, log, and
+    /// snapshot after a simulated crash. Always returns a `Follower` — role
+    /// is not persistent state, so a recovered node must win a fresh
+    /// election to lead again — and `commit_index` starts at
+    /// `snapshot.metadata.last_included_index` (zero if there's no snapshot
+    /// yet), not unconditionally zero: a snapshot can only ever have been
+    /// built from already-committed data, so that much of `commit_index`
+    /// *is* recoverable fact, not state to re-derive. Everything above that
+    /// point is still safely re-derived through normal replication.
     pub fn recover(
         id: NodeId,
         peers: Vec<NodeId>,
@@ -202,6 +254,7 @@ impl Node {
         heartbeat_interval: u64,
         hard_state: HardState,
         log: Vec<LogEntry>,
+        snapshot: Snapshot,
     ) -> Result<Self, ConfigError> {
         if peers.is_empty() {
             return Err(ConfigError::EmptyConfiguration);
@@ -234,10 +287,11 @@ impl Node {
             heartbeat_elapsed: 0,
             heartbeat_interval,
             log,
-            commit_index: 0,
+            commit_index: snapshot.metadata.last_included_index,
             next_index: BTreeMap::new(),
             match_index: BTreeMap::new(),
-            snapshot: SnapshotMetadata::default(),
+            snapshot: snapshot.metadata,
+            snapshot_data: snapshot.data,
         })
     }
 
@@ -298,6 +352,14 @@ impl Node {
 
     pub fn commit_index(&self) -> u64 {
         self.commit_index
+    }
+
+    pub fn snapshot(&self) -> SnapshotMetadata {
+        self.snapshot
+    }
+
+    pub fn snapshot_data(&self) -> &[u8] {
+        &self.snapshot_data
     }
 
     /// Applies one explicit input to this node's protocol state, returning the
@@ -757,6 +819,48 @@ impl Node {
         ))
     }
 
+    /// Compacts every log entry up to and including `up_to_index` into a
+    /// snapshot, discarding them from `log`. `snapshot_data` is opaque to
+    /// this crate, exactly like `LogEntry.command` — producing and
+    /// interpreting it is the state machine owner's job. Any role may call
+    /// this, not just the leader: self-compaction is how every node bounds
+    /// its own log growth, independent of who's currently leading.
+    ///
+    /// A no-op (`Ok(Vec::new())`) if `up_to_index` is at or before the
+    /// current snapshot boundary already — the same idempotent-retry
+    /// treatment every other effect-producing transition here gives a
+    /// request it's already satisfied. An error if `up_to_index` reaches
+    /// past `commit_index`: compacting an uncommitted entry could discard
+    /// state no majority has actually agreed on yet.
+    pub fn compact(
+        &mut self,
+        up_to_index: u64,
+        snapshot_data: Vec<u8>,
+    ) -> Result<Vec<Effect>, CompactError> {
+        if up_to_index <= self.snapshot.last_included_index {
+            return Ok(Vec::new());
+        }
+        if up_to_index > self.commit_index {
+            return Err(CompactError::IndexNotCommitted);
+        }
+
+        let last_included_term = self
+            .term_at(up_to_index)
+            .expect("a committed index is always present in the log or already the boundary");
+        self.log.drain(0..=self.vec_index(up_to_index));
+        self.snapshot = SnapshotMetadata {
+            last_included_index: up_to_index,
+            last_included_term,
+        };
+        self.snapshot_data = snapshot_data.clone();
+
+        Ok(vec![Effect::PersistSnapshot {
+            last_included_index: up_to_index,
+            last_included_term,
+            data: snapshot_data,
+        }])
+    }
+
     fn step_down(&mut self, term: u64) {
         self.role = Role::Follower;
         self.current_term = term;
@@ -780,8 +884,9 @@ mod tests {
     use std::collections::BTreeSet;
 
     use super::{
-        AppendEntries, AppendEntriesResponse, ConfigError, Effect, Event, HardState, LogEntry,
-        Message, Node, NodeId, RequestVote, RequestVoteResponse, Role,
+        AppendEntries, AppendEntriesResponse, CompactError, ConfigError, Effect, Event, HardState,
+        LogEntry, Message, Node, NodeId, RequestVote, RequestVoteResponse, Role, Snapshot,
+        SnapshotMetadata,
     };
 
     #[test]
@@ -817,8 +922,16 @@ mod tests {
             command: vec![1],
         }];
 
-        let node =
-            Node::recover(NodeId(1), peers, 1, 1, hard_state, log.clone()).expect("valid node");
+        let node = Node::recover(
+            NodeId(1),
+            peers,
+            1,
+            1,
+            hard_state,
+            log.clone(),
+            Snapshot::default(),
+        )
+        .expect("valid node");
 
         assert_eq!(node.role(), Role::Follower);
         assert_eq!(node.current_term(), 5);
@@ -828,8 +941,51 @@ mod tests {
     }
 
     #[test]
+    fn recover_initializes_commit_index_from_the_snapshot_boundary_not_zero() {
+        let peers = vec![NodeId(1), NodeId(2), NodeId(3)];
+        let snapshot = SnapshotMetadata {
+            last_included_index: 4,
+            last_included_term: 2,
+        };
+        let log = vec![LogEntry {
+            term: 2,
+            command: vec![9],
+        }];
+
+        let node = Node::recover(
+            NodeId(1),
+            peers,
+            1,
+            1,
+            HardState::default(),
+            log,
+            Snapshot {
+                metadata: snapshot,
+                data: vec![7, 7, 7],
+            },
+        )
+        .expect("valid node");
+
+        // A snapshot can only ever have been built from already-committed
+        // data, so that much of commit_index is recoverable fact, not
+        // state that must be re-derived from zero like role/next_index are.
+        assert_eq!(node.commit_index(), 4);
+        assert_eq!(node.snapshot(), snapshot);
+        assert_eq!(node.snapshot_data(), &[7, 7, 7]);
+        assert_eq!(node.last_log_index(), 5);
+    }
+
+    #[test]
     fn recover_validates_configuration_the_same_way_as_new() {
-        let result = Node::recover(NodeId(1), vec![], 1, 1, HardState::default(), Vec::new());
+        let result = Node::recover(
+            NodeId(1),
+            vec![],
+            1,
+            1,
+            HardState::default(),
+            Vec::new(),
+            Snapshot::default(),
+        );
 
         assert_eq!(
             result.expect_err("configuration must fail"),
@@ -1941,6 +2097,89 @@ mod tests {
 
         assert_eq!(index, 1);
         assert_eq!(node.commit_index(), 1);
+    }
+
+    #[test]
+    fn compact_discards_the_committed_prefix_and_persists_the_snapshot() {
+        let mut node = Node::new(NodeId(1), vec![NodeId(1)], 1, 1).expect("valid node");
+        node.step(Event::Tick { next_timeout: 5 });
+        node.propose(vec![1]);
+        node.propose(vec![2]);
+        node.propose(vec![3]);
+        assert_eq!(node.commit_index(), 3);
+
+        let effects = node.compact(2, vec![9, 9]).expect("2 is committed");
+
+        assert_eq!(
+            effects,
+            vec![Effect::PersistSnapshot {
+                last_included_index: 2,
+                last_included_term: 1,
+                data: vec![9, 9],
+            }]
+        );
+        assert_eq!(
+            node.snapshot(),
+            SnapshotMetadata {
+                last_included_index: 2,
+                last_included_term: 1,
+            }
+        );
+        assert_eq!(node.snapshot_data(), &[9, 9]);
+        // Compacted-away entries are gone from log(), but absolute indexing
+        // (last_log_index, entry_at) is unaffected by the boundary shift.
+        assert_eq!(
+            node.log(),
+            &[LogEntry {
+                term: 1,
+                command: vec![3]
+            }]
+        );
+        assert_eq!(node.last_log_index(), 3);
+        assert_eq!(node.entry_at(2), None);
+        assert_eq!(
+            node.entry_at(3),
+            Some(&LogEntry {
+                term: 1,
+                command: vec![3]
+            })
+        );
+    }
+
+    #[test]
+    fn compact_past_commit_index_is_rejected() {
+        let mut node = established_leader();
+        node.propose(vec![1]);
+        assert_eq!(node.commit_index(), 0);
+
+        let error = node
+            .compact(1, Vec::new())
+            .expect_err("index 1 is not committed yet");
+
+        assert_eq!(error, CompactError::IndexNotCommitted);
+    }
+
+    #[test]
+    fn compact_at_or_before_the_current_boundary_is_a_no_op() {
+        let mut node = Node::new(NodeId(1), vec![NodeId(1)], 1, 1).expect("valid node");
+        node.step(Event::Tick { next_timeout: 5 });
+        node.propose(vec![1]);
+        node.propose(vec![2]);
+        node.compact(1, vec![1]).expect("1 is committed");
+
+        let effects = node
+            .compact(1, vec![9])
+            .expect("already-compacted index is a no-op");
+
+        assert!(effects.is_empty());
+        assert_eq!(
+            node.snapshot(),
+            SnapshotMetadata {
+                last_included_index: 1,
+                last_included_term: 1,
+            }
+        );
+        assert_eq!(node.snapshot_data(), &[1]);
     }
 
     #[test]
