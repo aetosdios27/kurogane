@@ -60,6 +60,31 @@ pub struct AppendEntriesResponse {
     pub match_index: u64,
 }
 
+/// A leader's message installing a full snapshot on a follower whose
+/// `next_index` has fallen at or behind the leader's own compaction
+/// boundary — sent instead of `AppendEntries` in that case, since the
+/// entries it would otherwise need are gone. `data` is opaque to this
+/// crate, exactly like `LogEntry.command`. Single-shot: a toy-sized KV's
+/// state fits one message, and this crate does no chunking.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct InstallSnapshot {
+    pub term: u64,
+    pub leader_id: NodeId,
+    pub last_included_index: u64,
+    pub last_included_term: u64,
+    pub data: Vec<u8>,
+}
+
+/// The response to an `InstallSnapshot`. `last_included_index` echoes back
+/// the point now covered, so the leader can advance `next_index`/
+/// `match_index` for this peer the same way `AppendEntriesResponse.
+/// match_index` lets it do for ordinary replication.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct InstallSnapshotResponse {
+    pub term: u64,
+    pub last_included_index: u64,
+}
+
 /// A message understood by the transport-free Raft core.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Message {
@@ -67,6 +92,8 @@ pub enum Message {
     RequestVoteResponse(RequestVoteResponse),
     AppendEntries(AppendEntries),
     AppendEntriesResponse(AppendEntriesResponse),
+    InstallSnapshot(InstallSnapshot),
+    InstallSnapshotResponse(InstallSnapshotResponse),
 }
 
 /// One explicit input to a node transition.
@@ -391,6 +418,15 @@ impl Node {
                     Message::AppendEntriesResponse(response) => {
                         self.on_append_entries_response(from, response)
                     }
+                    Message::InstallSnapshot(request) => {
+                        if request.leader_id != from {
+                            return Vec::new();
+                        }
+                        self.on_install_snapshot(from, request)
+                    }
+                    Message::InstallSnapshotResponse(response) => {
+                        self.on_install_snapshot_response(from, response)
+                    }
                 }
             }
         }
@@ -649,26 +685,38 @@ impl Node {
 
         self.election_elapsed = 0;
 
-        if request.prev_log_index > 0 {
-            match self.term_at(request.prev_log_index) {
-                Some(term) if term == request.prev_log_term => {}
-                _ => {
-                    let mut effects = Vec::new();
-                    if stepped_down {
-                        effects.push(Effect::PersistHardState {
-                            term: self.current_term,
-                            voted_for: self.voted_for,
-                        });
-                    }
-                    effects.push(self.reject_append_entries(from));
-                    return effects;
-                }
+        // A `prev_log_index` at or before our own snapshot boundary is
+        // trivially satisfied: our snapshot can only ever have been built
+        // from already-committed data, and Leader Completeness guarantees
+        // any valid leader's log matches ours at every committed index —
+        // there's nothing left to check. This is reachable in ordinary
+        // operation, not just a defensive edge case: an ex-leader that
+        // compacted while leading, then stepped down, can receive a new
+        // leader's optimistic `next_index` guess that lands below its own
+        // compacted boundary via the normal back-off-by-one retry.
+        let prev_log_satisfied = request.prev_log_index <= self.snapshot.last_included_index
+            || self.term_at(request.prev_log_index) == Some(request.prev_log_term);
+        if !prev_log_satisfied {
+            let mut effects = Vec::new();
+            if stepped_down {
+                effects.push(Effect::PersistHardState {
+                    term: self.current_term,
+                    voted_for: self.voted_for,
+                });
             }
+            effects.push(self.reject_append_entries(from));
+            return effects;
         }
 
         let mut log_changed_from: Option<u64> = None;
         for (offset, entry) in request.entries.iter().enumerate() {
             let index = request.prev_log_index + offset as u64 + 1;
+            if index <= self.snapshot.last_included_index {
+                // Already compacted away, and guaranteed identical to what
+                // the leader is sending (same reasoning as above) — nothing
+                // to do.
+                continue;
+            }
             match self.term_at(index) {
                 Some(existing_term) if existing_term == entry.term => {}
                 Some(_) => {
@@ -715,6 +763,124 @@ impl Node {
             }),
         });
         effects
+    }
+
+    fn install_snapshot_response(&self, last_included_index: u64) -> InstallSnapshotResponse {
+        InstallSnapshotResponse {
+            term: self.current_term,
+            last_included_index,
+        }
+    }
+
+    /// Handles an incoming `InstallSnapshot` from a recognized leader. Every
+    /// path here ends in exactly one `Send` — `Actor::handle_peer_request`
+    /// (the runtime layer) pops the last effect as the direct RPC reply and
+    /// panics if it isn't one.
+    fn on_install_snapshot(&mut self, from: NodeId, request: InstallSnapshot) -> Vec<Effect> {
+        if request.term < self.current_term {
+            return vec![Effect::Send {
+                to: from,
+                message: Message::InstallSnapshotResponse(
+                    self.install_snapshot_response(self.snapshot.last_included_index),
+                ),
+            }];
+        }
+
+        let stepped_down = request.term > self.current_term;
+        if stepped_down {
+            self.step_down(request.term);
+        } else if self.role == Role::Candidate {
+            self.role = Role::Follower;
+        }
+
+        self.election_elapsed = 0;
+
+        let mut effects = Vec::new();
+        if stepped_down {
+            effects.push(Effect::PersistHardState {
+                term: self.current_term,
+                voted_for: self.voted_for,
+            });
+        }
+
+        // §7 retain rule: if we already have this exact point (and maybe
+        // more) via ordinary replication -- whether or not we've compacted
+        // it into our own snapshot yet -- this install is stale or
+        // duplicate. No-op: don't touch the log or the snapshot, just
+        // acknowledge what we already have.
+        let already_covered =
+            self.term_at(request.last_included_index) == Some(request.last_included_term);
+        if !already_covered {
+            self.log.clear();
+            self.snapshot = SnapshotMetadata {
+                last_included_index: request.last_included_index,
+                last_included_term: request.last_included_term,
+            };
+            self.snapshot_data = request.data.clone();
+            self.commit_index = self.commit_index.max(request.last_included_index);
+
+            effects.push(Effect::PersistSnapshot {
+                last_included_index: request.last_included_index,
+                last_included_term: request.last_included_term,
+                data: request.data,
+            });
+            // PersistSnapshot alone doesn't fully describe post-install log
+            // state -- pin down that nothing survives above the new
+            // boundary (any prior conflicting suffix in durable storage is
+            // now stale) with an explicit empty splice.
+            effects.push(Effect::PersistLog {
+                from_index: request.last_included_index + 1,
+                entries: Vec::new(),
+            });
+        }
+
+        effects.push(Effect::Send {
+            to: from,
+            message: Message::InstallSnapshotResponse(
+                self.install_snapshot_response(request.last_included_index),
+            ),
+        });
+        effects
+    }
+
+    fn on_install_snapshot_response(
+        &mut self,
+        from: NodeId,
+        response: InstallSnapshotResponse,
+    ) -> Vec<Effect> {
+        if response.term > self.current_term {
+            self.step_down(response.term);
+            return vec![Effect::PersistHardState {
+                term: self.current_term,
+                voted_for: self.voted_for,
+            }];
+        }
+
+        if response.term < self.current_term || self.role != Role::Leader {
+            return Vec::new();
+        }
+
+        let match_index = *self
+            .match_index
+            .get(&from)
+            .expect("match_index tracked for every peer while leader");
+        let match_index = match_index.max(response.last_included_index);
+        self.match_index.insert(from, match_index);
+        self.next_index.insert(from, match_index + 1);
+        self.advance_commit_index();
+
+        let next_index = *self
+            .next_index
+            .get(&from)
+            .expect("next_index tracked for every peer while leader");
+        if next_index <= self.last_log_index() {
+            vec![Effect::Send {
+                to: from,
+                message: Message::AppendEntries(self.append_entries_for(from)),
+            }]
+        } else {
+            Vec::new()
+        }
     }
 
     fn on_append_entries_response(
@@ -885,8 +1051,8 @@ mod tests {
 
     use super::{
         AppendEntries, AppendEntriesResponse, CompactError, ConfigError, Effect, Event, HardState,
-        LogEntry, Message, Node, NodeId, RequestVote, RequestVoteResponse, Role, Snapshot,
-        SnapshotMetadata,
+        InstallSnapshot, InstallSnapshotResponse, LogEntry, Message, Node, NodeId, RequestVote,
+        RequestVoteResponse, Role, Snapshot, SnapshotMetadata,
     };
 
     #[test]
@@ -1798,6 +1964,388 @@ mod tests {
     }
 
     #[test]
+    fn on_append_entries_treats_prev_log_index_at_the_snapshot_boundary_as_satisfied() {
+        let peers = vec![NodeId(1), NodeId(2), NodeId(3)];
+        let mut node = Node::new(NodeId(1), peers, 5, 2).expect("valid node");
+        node.step(Event::Step {
+            from: NodeId(2),
+            message: Message::AppendEntries(AppendEntries {
+                term: 1,
+                leader_id: NodeId(2),
+                prev_log_index: 0,
+                prev_log_term: 0,
+                entries: vec![
+                    LogEntry {
+                        term: 1,
+                        command: vec![1],
+                    },
+                    LogEntry {
+                        term: 1,
+                        command: vec![2],
+                    },
+                ],
+                leader_commit: 2,
+            }),
+        });
+        assert_eq!(node.commit_index(), 2);
+        node.compact(2, vec![9]).expect("index 2 is committed");
+        assert!(node.log().is_empty());
+
+        // prev_log_index sits exactly at the boundary -- term_at(2) only
+        // exists via the snapshot now, not the log, but the check must
+        // still pass.
+        let effects = node.step(Event::Step {
+            from: NodeId(2),
+            message: Message::AppendEntries(AppendEntries {
+                term: 1,
+                leader_id: NodeId(2),
+                prev_log_index: 2,
+                prev_log_term: 1,
+                entries: vec![LogEntry {
+                    term: 1,
+                    command: vec![3],
+                }],
+                leader_commit: 3,
+            }),
+        });
+
+        assert_eq!(
+            node.log(),
+            &[LogEntry {
+                term: 1,
+                command: vec![3]
+            }]
+        );
+        assert_eq!(node.last_log_index(), 3);
+        assert_eq!(
+            effects,
+            vec![
+                Effect::PersistLog {
+                    from_index: 3,
+                    entries: vec![LogEntry {
+                        term: 1,
+                        command: vec![3]
+                    }],
+                },
+                Effect::Send {
+                    to: NodeId(2),
+                    message: Message::AppendEntriesResponse(AppendEntriesResponse {
+                        term: 1,
+                        success: true,
+                        match_index: 3,
+                    }),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn on_append_entries_skips_entries_at_or_before_the_snapshot_boundary() {
+        let peers = vec![NodeId(1), NodeId(2), NodeId(3)];
+        let mut node = Node::new(NodeId(1), peers, 5, 2).expect("valid node");
+        let seed_entries = vec![
+            LogEntry {
+                term: 1,
+                command: vec![1],
+            },
+            LogEntry {
+                term: 1,
+                command: vec![2],
+            },
+            LogEntry {
+                term: 1,
+                command: vec![3],
+            },
+        ];
+        node.step(Event::Step {
+            from: NodeId(2),
+            message: Message::AppendEntries(AppendEntries {
+                term: 1,
+                leader_id: NodeId(2),
+                prev_log_index: 0,
+                prev_log_term: 0,
+                entries: seed_entries.clone(),
+                leader_commit: 3,
+            }),
+        });
+        node.compact(2, vec![9]).expect("index 2 is committed");
+        assert_eq!(
+            node.log(),
+            &[LogEntry {
+                term: 1,
+                command: vec![3]
+            }]
+        );
+
+        // A new leader's optimistic next_index guess sends prev_log_index
+        // 0 -- it has no idea this node has already compacted through
+        // index 2. Entries at or before the boundary must be silently
+        // skipped (they're guaranteed identical, already committed), not
+        // rejected or reapplied.
+        let effects = node.step(Event::Step {
+            from: NodeId(3),
+            message: Message::AppendEntries(AppendEntries {
+                term: 2,
+                leader_id: NodeId(3),
+                prev_log_index: 0,
+                prev_log_term: 0,
+                entries: seed_entries,
+                leader_commit: 3,
+            }),
+        });
+
+        assert_eq!(node.role(), Role::Follower);
+        assert_eq!(node.current_term(), 2);
+        assert_eq!(
+            node.log(),
+            &[LogEntry {
+                term: 1,
+                command: vec![3]
+            }]
+        );
+        assert_eq!(node.commit_index(), 3);
+        assert_eq!(
+            effects,
+            vec![
+                Effect::PersistHardState {
+                    term: 2,
+                    voted_for: None,
+                },
+                Effect::Send {
+                    to: NodeId(3),
+                    message: Message::AppendEntriesResponse(AppendEntriesResponse {
+                        term: 2,
+                        success: true,
+                        match_index: 3,
+                    }),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn rejects_stale_term_install_snapshot() {
+        let peers = vec![NodeId(1), NodeId(2), NodeId(3)];
+        let mut node = Node::new(NodeId(1), peers, 1, 1).expect("valid node");
+        node.step(Event::Tick { next_timeout: 5 });
+        assert_eq!(node.current_term(), 1);
+
+        let effects = node.step(Event::Step {
+            from: NodeId(2),
+            message: Message::InstallSnapshot(InstallSnapshot {
+                term: 0,
+                leader_id: NodeId(2),
+                last_included_index: 5,
+                last_included_term: 0,
+                data: vec![9],
+            }),
+        });
+
+        assert_eq!(node.role(), Role::Candidate);
+        assert_eq!(node.current_term(), 1);
+        assert!(node.log().is_empty());
+        assert_eq!(
+            effects,
+            vec![Effect::Send {
+                to: NodeId(2),
+                message: Message::InstallSnapshotResponse(InstallSnapshotResponse {
+                    term: 1,
+                    last_included_index: 0,
+                }),
+            }]
+        );
+    }
+
+    #[test]
+    fn ignores_install_snapshot_whose_leader_id_does_not_match_the_sender() {
+        let peers = vec![NodeId(1), NodeId(2), NodeId(3)];
+        let mut node = Node::new(NodeId(1), peers, 5, 2).expect("valid node");
+
+        let effects = node.step(Event::Step {
+            from: NodeId(2),
+            message: Message::InstallSnapshot(InstallSnapshot {
+                term: 1,
+                leader_id: NodeId(3),
+                last_included_index: 5,
+                last_included_term: 1,
+                data: vec![9],
+            }),
+        });
+
+        assert!(effects.is_empty());
+        assert_eq!(node.current_term(), 0);
+    }
+
+    #[test]
+    fn on_install_snapshot_installs_and_discards_any_existing_log() {
+        let peers = vec![NodeId(1), NodeId(2), NodeId(3)];
+        let mut node = Node::new(NodeId(1), peers, 5, 2).expect("valid node");
+        node.step(Event::Step {
+            from: NodeId(2),
+            message: Message::AppendEntries(AppendEntries {
+                term: 1,
+                leader_id: NodeId(2),
+                prev_log_index: 0,
+                prev_log_term: 0,
+                entries: vec![LogEntry {
+                    term: 1,
+                    command: vec![1],
+                }],
+                leader_commit: 0,
+            }),
+        });
+        assert_eq!(node.log().len(), 1);
+
+        let effects = node.step(Event::Step {
+            from: NodeId(2),
+            message: Message::InstallSnapshot(InstallSnapshot {
+                term: 1,
+                leader_id: NodeId(2),
+                last_included_index: 5,
+                last_included_term: 1,
+                data: vec![9, 9],
+            }),
+        });
+
+        assert_eq!(
+            node.snapshot(),
+            SnapshotMetadata {
+                last_included_index: 5,
+                last_included_term: 1,
+            }
+        );
+        assert_eq!(node.snapshot_data(), &[9, 9]);
+        assert!(node.log().is_empty());
+        assert_eq!(node.commit_index(), 5);
+        assert_eq!(node.last_log_index(), 5);
+        assert_eq!(
+            effects,
+            vec![
+                Effect::PersistSnapshot {
+                    last_included_index: 5,
+                    last_included_term: 1,
+                    data: vec![9, 9],
+                },
+                Effect::PersistLog {
+                    from_index: 6,
+                    entries: Vec::new(),
+                },
+                Effect::Send {
+                    to: NodeId(2),
+                    message: Message::InstallSnapshotResponse(InstallSnapshotResponse {
+                        term: 1,
+                        last_included_index: 5,
+                    }),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn on_install_snapshot_steps_down_on_higher_term() {
+        let peers = vec![NodeId(1), NodeId(2), NodeId(3)];
+        let mut node = Node::new(NodeId(1), peers, 1, 1).expect("valid node");
+        node.step(Event::Tick { next_timeout: 5 });
+        assert_eq!(node.role(), Role::Candidate);
+
+        let effects = node.step(Event::Step {
+            from: NodeId(2),
+            message: Message::InstallSnapshot(InstallSnapshot {
+                term: 2,
+                leader_id: NodeId(2),
+                last_included_index: 3,
+                last_included_term: 2,
+                data: vec![1],
+            }),
+        });
+
+        assert_eq!(node.role(), Role::Follower);
+        assert_eq!(node.current_term(), 2);
+        assert_eq!(node.voted_for(), None);
+        assert_eq!(
+            effects,
+            vec![
+                Effect::PersistHardState {
+                    term: 2,
+                    voted_for: None,
+                },
+                Effect::PersistSnapshot {
+                    last_included_index: 3,
+                    last_included_term: 2,
+                    data: vec![1],
+                },
+                Effect::PersistLog {
+                    from_index: 4,
+                    entries: Vec::new(),
+                },
+                Effect::Send {
+                    to: NodeId(2),
+                    message: Message::InstallSnapshotResponse(InstallSnapshotResponse {
+                        term: 2,
+                        last_included_index: 3,
+                    }),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn on_install_snapshot_is_a_no_op_when_the_receiver_already_covers_that_point() {
+        let peers = vec![NodeId(1), NodeId(2), NodeId(3)];
+        let mut node = Node::new(NodeId(1), peers, 5, 2).expect("valid node");
+        node.step(Event::Step {
+            from: NodeId(2),
+            message: Message::AppendEntries(AppendEntries {
+                term: 1,
+                leader_id: NodeId(2),
+                prev_log_index: 0,
+                prev_log_term: 0,
+                entries: vec![
+                    LogEntry {
+                        term: 1,
+                        command: vec![1],
+                    },
+                    LogEntry {
+                        term: 1,
+                        command: vec![2],
+                    },
+                ],
+                leader_commit: 2,
+            }),
+        });
+        assert_eq!(node.log().len(), 2);
+        assert_eq!(node.commit_index(), 2);
+
+        // A stale/duplicate InstallSnapshot for a point already covered by
+        // ordinary replication -- no-op, keep the existing (further-ahead)
+        // log rather than blowing it away.
+        let effects = node.step(Event::Step {
+            from: NodeId(2),
+            message: Message::InstallSnapshot(InstallSnapshot {
+                term: 1,
+                leader_id: NodeId(2),
+                last_included_index: 1,
+                last_included_term: 1,
+                data: vec![9, 9],
+            }),
+        });
+
+        assert_eq!(node.log().len(), 2);
+        assert_eq!(node.snapshot(), SnapshotMetadata::default());
+        assert!(node.snapshot_data().is_empty());
+        assert_eq!(
+            effects,
+            vec![Effect::Send {
+                to: NodeId(2),
+                message: Message::InstallSnapshotResponse(InstallSnapshotResponse {
+                    term: 1,
+                    last_included_index: 1,
+                }),
+            }]
+        );
+    }
+
+    #[test]
     fn grants_vote_when_candidate_log_is_at_least_as_up_to_date() {
         let peers = vec![NodeId(1), NodeId(2), NodeId(3)];
         let mut node = Node::new(NodeId(1), peers, 5, 2).expect("valid node");
@@ -2180,6 +2728,63 @@ mod tests {
             }
         );
         assert_eq!(node.snapshot_data(), &[1]);
+    }
+
+    #[test]
+    fn on_install_snapshot_response_advances_match_and_next_index_and_retries() {
+        let mut node = established_leader();
+        node.propose(vec![1]);
+        node.propose(vec![2]);
+
+        let effects = node.step(Event::Step {
+            from: NodeId(2),
+            message: Message::InstallSnapshotResponse(InstallSnapshotResponse {
+                term: 1,
+                last_included_index: 1,
+            }),
+        });
+
+        assert_eq!(node.commit_index(), 1);
+        assert_eq!(
+            effects,
+            vec![Effect::Send {
+                to: NodeId(2),
+                message: Message::AppendEntries(AppendEntries {
+                    term: 1,
+                    leader_id: NodeId(1),
+                    prev_log_index: 1,
+                    prev_log_term: 1,
+                    entries: vec![LogEntry {
+                        term: 1,
+                        command: vec![2],
+                    }],
+                    leader_commit: 1,
+                }),
+            }]
+        );
+    }
+
+    #[test]
+    fn on_install_snapshot_response_steps_down_on_higher_term() {
+        let mut node = established_leader();
+
+        let effects = node.step(Event::Step {
+            from: NodeId(3),
+            message: Message::InstallSnapshotResponse(InstallSnapshotResponse {
+                term: 5,
+                last_included_index: 0,
+            }),
+        });
+
+        assert_eq!(
+            effects,
+            vec![Effect::PersistHardState {
+                term: 5,
+                voted_for: None,
+            }]
+        );
+        assert_eq!(node.role(), Role::Follower);
+        assert_eq!(node.current_term(), 5);
     }
 
     #[test]
