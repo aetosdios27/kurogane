@@ -283,6 +283,20 @@ pub struct Node {
     votes_granted: BTreeSet<NodeId>,
     heartbeat_elapsed: u64,
     heartbeat_interval: u64,
+    /// Ticks elapsed since this node last accepted an `AppendEntries` or
+    /// `InstallSnapshot` from a current-or-higher-term leader -- reset only
+    /// in those two handlers' success paths, alongside `election_elapsed`.
+    /// Deliberately NOT reset by granting a vote or by starting an
+    /// election, unlike `election_elapsed`: it exists specifically so
+    /// `on_request_vote`'s Follower/Candidate disruption guard has a
+    /// "heard from a leader recently" signal that vote-granting can't
+    /// collide with (`election_elapsed` can't serve that role -- see the
+    /// guard's doc comment). Transient timing state, same category as
+    /// `election_elapsed`/`heartbeat_elapsed`: not part of `HardState`, not
+    /// persisted, safely re-initialized on `recover`/`new` -- to
+    /// `heartbeat_interval`, not 0, since 0 would misrepresent a node that
+    /// has never heard from any leader as having just done so.
+    leader_contact_elapsed: u64,
     log: Vec<LogEntry>,
     commit_index: u64,
     next_index: BTreeMap<NodeId, u64>,
@@ -448,6 +462,13 @@ impl Node {
             votes_granted: BTreeSet::new(),
             heartbeat_elapsed: 0,
             heartbeat_interval,
+            // Starts at (not below) heartbeat_interval, not 0: 0 would mean
+            // "just heard from a leader," which is false for a node that
+            // has never heard from one -- a freshly constructed/recovered
+            // node must not spuriously trip the Follower/Candidate
+            // disruption guard in on_request_vote before any real leader
+            // contact has happened.
+            leader_contact_elapsed: heartbeat_interval,
             log,
             commit_index: snapshot.metadata.last_included_index,
             next_index: BTreeMap::new(),
@@ -528,6 +549,10 @@ impl Node {
 
     pub fn heartbeat_interval(&self) -> u64 {
         self.heartbeat_interval
+    }
+
+    pub fn leader_contact_elapsed(&self) -> u64 {
+        self.leader_contact_elapsed
     }
 
     pub fn last_log_index(&self) -> u64 {
@@ -664,6 +689,7 @@ impl Node {
         }
 
         self.election_elapsed += 1;
+        self.leader_contact_elapsed += 1;
         if self.election_elapsed < self.election_timeout {
             return Vec::new();
         }
@@ -673,6 +699,7 @@ impl Node {
 
     fn on_leader_tick(&mut self) -> Vec<Effect> {
         self.heartbeat_elapsed += 1;
+        self.leader_contact_elapsed += 1;
         if self.heartbeat_elapsed < self.heartbeat_interval {
             return Vec::new();
         }
@@ -856,32 +883,58 @@ impl Node {
         // leader still learns of the new term normally once the partition
         // heals, via AppendEntriesResponse/InstallSnapshotResponse term
         // comparison -- not via RequestVote.
-        //
-        // The paper's matching Follower/Candidate-side guard (skip
-        // granting, don't step down, while this node's own election timer
-        // hasn't expired) is deliberately NOT implemented here. `on_tick`
-        // increments `election_elapsed` then checks it against
-        // `election_timeout`, and `start_election` resets it back to 0 the
-        // instant that threshold is reached -- so for any node for which
-        // `self.id` is a voter, `election_elapsed < election_timeout` is
-        // not a real-time-varying condition but an invariant that holds at
-        // all times while `role != Leader`: it becomes observably false
-        // only by the node itself becoming a fresh `Candidate` first, which
-        // immediately resets it to 0 again. A blanket Follower/Candidate
-        // guard keyed on that comparison would make the ordinary
-        // vote-granting path permanently unreachable for every voter,
-        // breaking essentially every multi-node election in the test
-        // suite -- confirmed empirically before this comment was written,
-        // not merely reasoned about. Closing this gap needs a real "heard
-        // from a leader" signal distinct from `election_elapsed` (e.g. a
-        // separate flag set only by `on_append_entries`/
-        // `on_install_snapshot`'s success paths), which is out of this
-        // stage's scope; the residual exposure is narrow, since a removed
-        // voter is only reachable here during the joint-consensus window
-        // in the first place -- `step()`'s `is_member` choke point already
-        // drops a `RequestVote` from a server fully excluded from
-        // `current_config` today.
         if self.role == Role::Leader {
+            return vec![Effect::Send {
+                to: from,
+                message: Message::RequestVoteResponse(RequestVoteResponse {
+                    term: self.current_term,
+                    granted: false,
+                }),
+            }];
+        }
+
+        // The paper's matching Follower/Candidate-side guard: disregard an
+        // incoming RequestVote -- including a higher-term one -- without
+        // stepping down or granting, while this node has heard from a
+        // current-or-higher-term leader within the last `heartbeat_interval`
+        // ticks. This is deliberately keyed on `leader_contact_elapsed`, not
+        // `election_elapsed`: `election_elapsed` is also reset by granting a
+        // vote (below) and by `start_election`, so for any voting Follower/
+        // Candidate, `election_elapsed < election_timeout` holds as an
+        // invariant essentially all the time -- it becomes false only by
+        // the node itself becoming a fresh Candidate first, which
+        // immediately resets it back to 0. Keying the guard on that
+        // comparison would make ordinary vote-granting permanently
+        // unreachable for every voter, breaking essentially every
+        // multi-node election in the test suite -- confirmed empirically,
+        // not merely reasoned about. `leader_contact_elapsed` has no such
+        // collision: it is reset only by `on_append_entries`/
+        // `on_install_snapshot`'s success paths, never by granting a vote
+        // or starting an election, so it tracks leader contact and nothing
+        // else.
+        //
+        // Deliberately scoped to `current_config.old_voters.is_some()` --
+        // an active joint-consensus transition -- rather than applying
+        // unconditionally. `step()`'s `is_member` choke point already drops
+        // a RequestVote from any node fully outside `current_config`
+        // (neither a voter, an old voter, nor a learner), which is the
+        // *only* way a genuinely removed server's message could reach this
+        // function at all; the sole remaining window for the paper's
+        // concern is a server still tracked in `old_voters` during the
+        // joint phase. Applying the guard unconditionally instead would
+        // catch nothing that scoping it this way doesn't already catch,
+        // while regressing ordinary (non-transitioning) election liveness:
+        // confirmed empirically -- an unconditional version delays a
+        // legitimate re-election by up to one `heartbeat_interval` for any
+        // follower that received the old (now genuinely dead/partitioned)
+        // leader's last heartbeat moments before the partition, breaking
+        // pre-existing election tests that predate this milestone and have
+        // every right to assume it doesn't change their behavior.
+        // `self.role` is Follower or Candidate here -- Leader already
+        // returned above.
+        if self.current_config.old_voters.is_some()
+            && self.leader_contact_elapsed < self.heartbeat_interval
+        {
             return vec![Effect::Send {
                 to: from,
                 message: Message::RequestVoteResponse(RequestVoteResponse {
@@ -978,6 +1031,7 @@ impl Node {
         }
 
         self.election_elapsed = 0;
+        self.leader_contact_elapsed = 0;
 
         // A `prev_log_index` at or before our own snapshot boundary is
         // trivially satisfied: our snapshot can only ever have been built
@@ -1091,6 +1145,7 @@ impl Node {
         }
 
         self.election_elapsed = 0;
+        self.leader_contact_elapsed = 0;
 
         let mut effects = Vec::new();
         if stepped_down {
@@ -2014,6 +2069,304 @@ mod tests {
                     granted: false,
                 }),
             }]
+        );
+    }
+
+    #[test]
+    fn a_freshly_constructed_node_does_not_spuriously_trigger_the_disruption_guard() {
+        let node =
+            Node::new(NodeId(1), vec![NodeId(1), NodeId(2), NodeId(3)], 5, 2).expect("valid node");
+        assert_eq!(
+            node.leader_contact_elapsed(),
+            2,
+            "a node that has never heard from any leader must not read as \
+             though it just did -- it starts at heartbeat_interval, not 0"
+        );
+    }
+
+    #[test]
+    fn a_follower_in_a_joint_transition_disregards_a_higher_term_request_vote_while_leader_contact_is_recent()
+     {
+        let joint_config = ClusterConfig {
+            voters: vec![NodeId(1), NodeId(4), NodeId(5)],
+            old_voters: Some(vec![NodeId(1), NodeId(2), NodeId(3)]),
+        };
+        let log = vec![LogEntry {
+            term: 0,
+            payload: LogPayload::Configuration(joint_config),
+        }];
+        let mut node = Node::recover(
+            NodeId(2),
+            vec![NodeId(1), NodeId(2), NodeId(3)],
+            5,
+            1,
+            HardState::default(),
+            log,
+            Snapshot::default(),
+            Vec::new(),
+        )
+        .expect("valid node");
+
+        // A legitimate heartbeat from the current leader resets
+        // leader_contact_elapsed to 0.
+        node.step(Event::Step {
+            from: NodeId(1),
+            message: Message::AppendEntries(AppendEntries {
+                term: 1,
+                leader_id: NodeId(1),
+                prev_log_index: 1,
+                prev_log_term: 0,
+                entries: Vec::new(),
+                leader_commit: 0,
+            }),
+        });
+        assert_eq!(node.leader_contact_elapsed(), 0);
+
+        let effects = node.step(Event::Step {
+            from: NodeId(3),
+            message: Message::RequestVote(RequestVote {
+                term: 5,
+                candidate_id: NodeId(3),
+                last_log_index: 1,
+                last_log_term: 0,
+            }),
+        });
+
+        assert_eq!(
+            node.current_term(),
+            1,
+            "a stray higher-term RequestVote must not move the term while \
+             leader contact is recent and a joint transition is in flight"
+        );
+        assert_eq!(node.voted_for(), None);
+        assert_eq!(
+            effects,
+            vec![Effect::Send {
+                to: NodeId(3),
+                message: Message::RequestVoteResponse(RequestVoteResponse {
+                    term: 1,
+                    granted: false,
+                }),
+            }]
+        );
+    }
+
+    #[test]
+    fn a_follower_in_a_joint_transition_grants_a_higher_term_request_vote_once_leader_contact_is_stale()
+     {
+        let joint_config = ClusterConfig {
+            voters: vec![NodeId(1), NodeId(4), NodeId(5)],
+            old_voters: Some(vec![NodeId(1), NodeId(2), NodeId(3)]),
+        };
+        let log = vec![LogEntry {
+            term: 0,
+            payload: LogPayload::Configuration(joint_config),
+        }];
+        let mut node = Node::recover(
+            NodeId(2),
+            vec![NodeId(1), NodeId(2), NodeId(3)],
+            5,
+            1,
+            HardState::default(),
+            log,
+            Snapshot::default(),
+            Vec::new(),
+        )
+        .expect("valid node");
+
+        node.step(Event::Step {
+            from: NodeId(1),
+            message: Message::AppendEntries(AppendEntries {
+                term: 1,
+                leader_id: NodeId(1),
+                prev_log_index: 1,
+                prev_log_term: 0,
+                entries: Vec::new(),
+                leader_commit: 0,
+            }),
+        });
+        assert_eq!(node.leader_contact_elapsed(), 0);
+
+        // One tick clears leader_contact_elapsed past heartbeat_interval
+        // (1): the guard must fall through to ordinary voting rules.
+        node.step(Event::Tick { next_timeout: 5 });
+        assert_eq!(node.leader_contact_elapsed(), 1);
+
+        let effects = node.step(Event::Step {
+            from: NodeId(3),
+            message: Message::RequestVote(RequestVote {
+                term: 5,
+                candidate_id: NodeId(3),
+                last_log_index: 1,
+                last_log_term: 0,
+            }),
+        });
+
+        assert_eq!(
+            node.current_term(),
+            5,
+            "once leader contact is stale, an ordinary higher-term \
+             RequestVote is handled normally, joint transition or not"
+        );
+        assert_eq!(node.voted_for(), Some(NodeId(3)));
+        assert_eq!(
+            effects,
+            vec![
+                Effect::PersistHardState {
+                    term: 5,
+                    voted_for: Some(NodeId(3)),
+                },
+                Effect::Send {
+                    to: NodeId(3),
+                    message: Message::RequestVoteResponse(RequestVoteResponse {
+                        term: 5,
+                        granted: true,
+                    }),
+                }
+            ]
+        );
+    }
+
+    #[test]
+    fn the_disruption_guard_does_not_apply_outside_a_joint_consensus_transition() {
+        // Same recent-leader-contact setup as the joint-transition guard
+        // test, but with a single, stable (non-joint) configuration --
+        // step()'s is_member choke point already drops a RequestVote from
+        // any node fully outside current_config, which is the only way a
+        // genuinely removed server's message could reach this function at
+        // all, so the guard has nothing left to protect against here and
+        // must not fire.
+        let mut node =
+            Node::new(NodeId(2), vec![NodeId(1), NodeId(2), NodeId(3)], 5, 1).expect("valid node");
+
+        node.step(Event::Step {
+            from: NodeId(1),
+            message: Message::AppendEntries(AppendEntries {
+                term: 1,
+                leader_id: NodeId(1),
+                prev_log_index: 0,
+                prev_log_term: 0,
+                entries: Vec::new(),
+                leader_commit: 0,
+            }),
+        });
+        assert_eq!(node.leader_contact_elapsed(), 0);
+
+        let effects = node.step(Event::Step {
+            from: NodeId(3),
+            message: Message::RequestVote(RequestVote {
+                term: 5,
+                candidate_id: NodeId(3),
+                last_log_index: 0,
+                last_log_term: 0,
+            }),
+        });
+
+        assert_eq!(
+            node.current_term(),
+            5,
+            "outside a joint transition, recent leader contact must not \
+             block an ordinary higher-term RequestVote"
+        );
+        assert_eq!(node.voted_for(), Some(NodeId(3)));
+        assert_eq!(
+            effects,
+            vec![
+                Effect::PersistHardState {
+                    term: 5,
+                    voted_for: Some(NodeId(3)),
+                },
+                Effect::Send {
+                    to: NodeId(3),
+                    message: Message::RequestVoteResponse(RequestVoteResponse {
+                        term: 5,
+                        granted: true,
+                    }),
+                }
+            ]
+        );
+    }
+
+    #[test]
+    fn granting_a_vote_does_not_arm_the_disruption_guard_for_a_later_legitimate_request_vote() {
+        // The bug this fix specifically corrects: election_elapsed is reset
+        // by granting a vote, which is exactly why the guard cannot be
+        // keyed on election_elapsed. leader_contact_elapsed must be
+        // unaffected by granting a vote, so a follower that just granted
+        // one to candidate A can still correctly evaluate candidate B's
+        // legitimate higher-term RequestVote on its own merits right
+        // afterward, inside a joint transition where the guard is active.
+        let joint_config = ClusterConfig {
+            voters: vec![NodeId(1), NodeId(4), NodeId(5)],
+            old_voters: Some(vec![NodeId(1), NodeId(2), NodeId(3)]),
+        };
+        let log = vec![LogEntry {
+            term: 0,
+            payload: LogPayload::Configuration(joint_config),
+        }];
+        let mut node = Node::recover(
+            NodeId(2),
+            vec![NodeId(1), NodeId(2), NodeId(3)],
+            5,
+            1,
+            HardState::default(),
+            log,
+            Snapshot::default(),
+            Vec::new(),
+        )
+        .expect("valid node");
+        // Never having heard from a leader, leader_contact_elapsed starts
+        // at heartbeat_interval (1) -- already stale, so the guard is
+        // inert from the very first RequestVote in this test.
+        assert_eq!(node.leader_contact_elapsed(), 1);
+
+        // Grant a vote to candidate A in term 5.
+        node.step(Event::Step {
+            from: NodeId(1),
+            message: Message::RequestVote(RequestVote {
+                term: 5,
+                candidate_id: NodeId(1),
+                last_log_index: 1,
+                last_log_term: 0,
+            }),
+        });
+        assert_eq!(node.current_term(), 5);
+        assert_eq!(node.voted_for(), Some(NodeId(1)));
+        // election_elapsed was reset by the grant; leader_contact_elapsed
+        // was not (this is the entire point of tracking them separately).
+        assert_eq!(node.leader_contact_elapsed(), 1);
+
+        // Candidate B's legitimate higher-term RequestVote must be
+        // evaluated normally -- not blocked as though a leader had just
+        // made contact, since granting a vote never touched
+        // leader_contact_elapsed.
+        let effects = node.step(Event::Step {
+            from: NodeId(3),
+            message: Message::RequestVote(RequestVote {
+                term: 6,
+                candidate_id: NodeId(3),
+                last_log_index: 1,
+                last_log_term: 0,
+            }),
+        });
+
+        assert_eq!(node.current_term(), 6);
+        assert_eq!(node.voted_for(), Some(NodeId(3)));
+        assert_eq!(
+            effects,
+            vec![
+                Effect::PersistHardState {
+                    term: 6,
+                    voted_for: Some(NodeId(3)),
+                },
+                Effect::Send {
+                    to: NodeId(3),
+                    message: Message::RequestVoteResponse(RequestVoteResponse {
+                        term: 6,
+                        granted: true,
+                    }),
+                }
+            ]
         );
     }
 
