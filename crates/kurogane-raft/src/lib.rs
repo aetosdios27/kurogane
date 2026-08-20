@@ -303,6 +303,15 @@ fn latest_configuration_in(log: &[LogEntry]) -> Option<ClusterConfig> {
     })
 }
 
+/// Whether `reached` holds for a strict majority of `set`, independent of
+/// any other set — the building block for joint consensus's dual-majority
+/// rule, which requires this to hold separately for both the old and new
+/// voter sets while a configuration transition is in flight.
+fn majority_reached(set: &[NodeId], reached: impl Fn(NodeId) -> bool) -> bool {
+    let quorum = set.len() / 2 + 1;
+    set.iter().filter(|&&id| reached(id)).count() >= quorum
+}
+
 impl Node {
     /// Constructs a follower in term zero from a fixed, canonical membership.
     /// A fresh node is just the degenerate case of having recovered from no
@@ -1053,8 +1062,16 @@ impl Node {
     /// The majority-commit rule restricted to the current term (Raft's
     /// Figure 8 guard): a prior-term entry never commits by count alone, only
     /// indirectly once a current-term entry at or after it does.
+    ///
+    /// While `current_config.old_voters` is `Some` (a joint-consensus
+    /// transition is in flight), an entry only commits once it's matched by
+    /// a majority of *both* the new voters and the old voters — the
+    /// paper's dual-majority rule. The combined candidate is the minimum of
+    /// the two sets' own thresholds, not the maximum: taking the maximum
+    /// would let an entry commit on one side's majority alone, exactly the
+    /// split-brain scenario joint consensus exists to prevent.
     fn advance_commit_index(&mut self) {
-        let mut match_indices: Vec<u64> = self
+        let mut new_match_indices: Vec<u64> = self
             .current_config
             .voters
             .iter()
@@ -1070,9 +1087,40 @@ impl Node {
                 }
             })
             .collect();
-        match_indices.sort_unstable();
+        new_match_indices.sort_unstable();
+        let new_candidate =
+            new_match_indices[self.current_config.voters.len() - self.quorum_size()];
 
-        let candidate = match_indices[self.current_config.voters.len() - self.quorum_size()];
+        let candidate = match &self.current_config.old_voters {
+            None => new_candidate,
+            Some(old_voters) => {
+                // A peer being removed by this transition may never have
+                // been seeded into `match_index` -- `become_leader` seeds
+                // it from `current_config.voters` alone, and a
+                // removed-only peer (present in `old_voters`, absent from
+                // `voters`) was never a target of that seeding. Treat an
+                // untracked peer as "not caught up" (index 0) rather than
+                // assuming progress: full next_index/match_index seeding
+                // across voters ∪ old_voters ∪ learners lands once
+                // learners exist as a concept, not here.
+                let mut old_match_indices: Vec<u64> = old_voters
+                    .iter()
+                    .copied()
+                    .map(|peer| {
+                        if peer == self.id {
+                            self.last_log_index()
+                        } else {
+                            self.match_index.get(&peer).copied().unwrap_or(0)
+                        }
+                    })
+                    .collect();
+                old_match_indices.sort_unstable();
+                let old_quorum = old_voters.len() / 2 + 1;
+                let old_candidate = old_match_indices[old_voters.len() - old_quorum];
+                new_candidate.min(old_candidate)
+            }
+        };
+
         if candidate > self.commit_index && self.term_at(candidate) == Some(self.current_term) {
             self.commit_index = candidate;
         }
@@ -1177,8 +1225,18 @@ impl Node {
         self.current_config.voters.len() / 2 + 1
     }
 
+    /// Whether an election has been won. While `current_config.old_voters`
+    /// is `Some`, this requires a majority of the old voters too, not just
+    /// the new ones — the same dual-majority rule `advance_commit_index`
+    /// applies to commitment, applied here to elections instead.
     fn has_quorum(&self) -> bool {
-        self.votes_granted.len() >= self.quorum_size()
+        let new_majority = self.votes_granted.len() >= self.quorum_size();
+        match &self.current_config.old_voters {
+            None => new_majority,
+            Some(old_voters) => {
+                new_majority && majority_reached(old_voters, |id| self.votes_granted.contains(&id))
+            }
+        }
     }
 }
 
@@ -3142,5 +3200,143 @@ mod tests {
             }),
         });
         assert_eq!(node.commit_index(), 2);
+    }
+
+    #[test]
+    fn a_joint_election_requires_a_majority_of_both_the_old_and_new_voters() {
+        let joint_config = ClusterConfig {
+            voters: vec![NodeId(1), NodeId(4), NodeId(5)],
+            old_voters: Some(vec![NodeId(1), NodeId(2), NodeId(3)]),
+        };
+        let log = vec![LogEntry {
+            term: 0,
+            payload: LogPayload::Configuration(joint_config.clone()),
+        }];
+        let mut node = Node::recover(
+            NodeId(1),
+            vec![NodeId(1)],
+            3,
+            3,
+            HardState::default(),
+            log,
+            Snapshot::default(),
+        )
+        .expect("valid node");
+        assert_eq!(node.current_config(), &joint_config);
+
+        node.step(Event::Tick { next_timeout: 5 });
+        node.step(Event::Tick { next_timeout: 5 });
+        let effects = node.step(Event::Tick { next_timeout: 5 });
+        assert_eq!(node.role(), Role::Candidate);
+        assert!(
+            effects
+                .iter()
+                .any(|effect| matches!(effect, Effect::Send { to: NodeId(4), .. }))
+        );
+
+        // A majority of the new set alone (self + 4) is not enough: the old
+        // set (1, 2, 3) has granted nothing beyond self's own vote.
+        node.step(Event::Step {
+            from: NodeId(4),
+            message: Message::RequestVoteResponse(RequestVoteResponse {
+                term: node.current_term(),
+                granted: true,
+            }),
+        });
+        assert_eq!(
+            node.role(),
+            Role::Candidate,
+            "new-set majority alone must not win a joint election"
+        );
+
+        // Once the old set also reaches its own majority (self + 2), the
+        // election is won.
+        let effects = node.step(Event::Step {
+            from: NodeId(2),
+            message: Message::RequestVoteResponse(RequestVoteResponse {
+                term: node.current_term(),
+                granted: true,
+            }),
+        });
+
+        assert_eq!(node.role(), Role::Leader);
+        assert!(!effects.is_empty());
+    }
+
+    /// Distinguishes a correct (minimum-of-both-thresholds) dual-majority
+    /// commit rule from an incorrect (maximum-of-both-thresholds) one: a
+    /// `max`-based implementation would already commit after the *first*
+    /// response below (new-set majority alone), which is exactly the
+    /// split-brain scenario joint consensus exists to rule out, since the
+    /// old set hasn't independently agreed to anything yet.
+    #[test]
+    fn a_joint_commit_requires_match_progress_on_both_the_old_and_new_voters() {
+        let joint_config = ClusterConfig {
+            voters: vec![NodeId(1), NodeId(4), NodeId(5)],
+            old_voters: Some(vec![NodeId(1), NodeId(4)]),
+        };
+        let log = vec![LogEntry {
+            term: 0,
+            payload: LogPayload::Configuration(joint_config.clone()),
+        }];
+        let mut node = Node::recover(
+            NodeId(1),
+            vec![NodeId(1)],
+            3,
+            3,
+            HardState::default(),
+            log,
+            Snapshot::default(),
+        )
+        .expect("valid node");
+
+        node.step(Event::Tick { next_timeout: 5 });
+        node.step(Event::Tick { next_timeout: 5 });
+        node.step(Event::Tick { next_timeout: 5 });
+        // A single grant from NodeId(4) satisfies both the new-set quorum
+        // (self + 4, of 3) and the old-set quorum (self + 4, of 2 -- the
+        // old set here is exactly {1, 4}, so it requires both members).
+        node.step(Event::Step {
+            from: NodeId(4),
+            message: Message::RequestVoteResponse(RequestVoteResponse {
+                term: node.current_term(),
+                granted: true,
+            }),
+        });
+        assert_eq!(node.role(), Role::Leader);
+
+        let (index, _effects) = node.propose(vec![9]).expect("leader accepts propose");
+        assert_eq!(index, 2, "index 1 is the joint config entry itself");
+        assert_eq!(node.commit_index(), 0);
+
+        // NodeId(5) is in the new set only. Its catching up alone reaches
+        // new-set majority (self + 5, of 3) but the old set (1, 4) still
+        // has only self's own progress -- below its own quorum of 2.
+        node.step(Event::Step {
+            from: NodeId(5),
+            message: Message::AppendEntriesResponse(AppendEntriesResponse {
+                term: node.current_term(),
+                success: true,
+                match_index: index,
+            }),
+        });
+        assert_eq!(
+            node.commit_index(),
+            0,
+            "new-set majority alone must not commit a joint entry"
+        );
+
+        // NodeId(4) catching up now completes the old set's own majority
+        // too (self + 4, of 2) -- both thresholds are satisfied, so the
+        // entry finally commits.
+        node.step(Event::Step {
+            from: NodeId(4),
+            message: Message::AppendEntriesResponse(AppendEntriesResponse {
+                term: node.current_term(),
+                success: true,
+                match_index: index,
+            }),
+        });
+        assert_eq!(node.commit_index(), index);
     }
 }
