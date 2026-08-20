@@ -4,22 +4,26 @@ use std::fs;
 use std::io::{self, Write};
 use std::path::PathBuf;
 
-use kurogane_raft::{Effect, HardState, LogEntry, NodeId, SnapshotMetadata};
+use kurogane_raft::{ClusterConfig, Effect, HardState, LogEntry, NodeId, SnapshotMetadata};
 use prost::Message;
 
-use crate::dto::{log_entry_from_proto, log_entry_to_proto};
+use crate::dto::{
+    configuration_from_proto, configuration_to_proto, log_entry_from_proto, log_entry_to_proto,
+};
 use crate::proto;
 
-/// One node's durable storage: a single file holding hard state, log, and
-/// snapshot, rewritten and fsynced on every `Persist*` effect. No WAL or
-/// checksums — a synchronous write+flush is what the declared crash model
-/// actually requires, not more than that.
+/// One node's durable storage: a single file holding hard state, log,
+/// snapshot, and learner set, rewritten and fsynced on every `Persist*`
+/// effect. No WAL or checksums — a synchronous write+flush is what the
+/// declared crash model actually requires, not more than that.
 pub struct Storage {
     path: PathBuf,
     hard_state: HardState,
     log: Vec<LogEntry>,
     snapshot: SnapshotMetadata,
     snapshot_data: Vec<u8>,
+    snapshot_config: ClusterConfig,
+    learners: Vec<NodeId>,
 }
 
 impl Storage {
@@ -27,37 +31,45 @@ impl Storage {
     /// means a fresh node: default hard state, empty log, no snapshot.
     pub fn open(path: impl Into<PathBuf>) -> io::Result<Self> {
         let path = path.into();
-        let (hard_state, log, snapshot, snapshot_data) = match fs::read(&path) {
-            Ok(bytes) => {
-                let record = proto::StorageState::decode(bytes.as_slice())
-                    .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-                let log = record
-                    .log
-                    .into_iter()
-                    .map(log_entry_from_proto)
-                    .collect::<Result<Vec<_>, _>>()
-                    .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-                (
-                    HardState {
-                        current_term: record.current_term,
-                        voted_for: record.voted_for.map(NodeId),
-                    },
-                    log,
-                    SnapshotMetadata {
-                        last_included_index: record.snapshot_last_included_index,
-                        last_included_term: record.snapshot_last_included_term,
-                    },
-                    record.snapshot_data,
-                )
-            }
-            Err(error) if error.kind() == io::ErrorKind::NotFound => (
-                HardState::default(),
-                Vec::new(),
-                SnapshotMetadata::default(),
-                Vec::new(),
-            ),
-            Err(error) => return Err(error),
-        };
+        let (hard_state, log, snapshot, snapshot_data, snapshot_config, learners) =
+            match fs::read(&path) {
+                Ok(bytes) => {
+                    let record = proto::StorageState::decode(bytes.as_slice())
+                        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+                    let log = record
+                        .log
+                        .into_iter()
+                        .map(log_entry_from_proto)
+                        .collect::<Result<Vec<_>, _>>()
+                        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+                    (
+                        HardState {
+                            current_term: record.current_term,
+                            voted_for: record.voted_for.map(NodeId),
+                        },
+                        log,
+                        SnapshotMetadata {
+                            last_included_index: record.snapshot_last_included_index,
+                            last_included_term: record.snapshot_last_included_term,
+                        },
+                        record.snapshot_data,
+                        record
+                            .snapshot_config
+                            .map(configuration_from_proto)
+                            .unwrap_or_default(),
+                        record.learners.into_iter().map(NodeId).collect(),
+                    )
+                }
+                Err(error) if error.kind() == io::ErrorKind::NotFound => (
+                    HardState::default(),
+                    Vec::new(),
+                    SnapshotMetadata::default(),
+                    Vec::new(),
+                    ClusterConfig::default(),
+                    Vec::new(),
+                ),
+                Err(error) => return Err(error),
+            };
 
         Ok(Self {
             path,
@@ -65,6 +77,8 @@ impl Storage {
             log,
             snapshot,
             snapshot_data,
+            snapshot_config,
+            learners,
         })
     }
 
@@ -82,6 +96,19 @@ impl Storage {
 
     pub fn snapshot_data(&self) -> &[u8] {
         &self.snapshot_data
+    }
+
+    /// The membership active as of the current snapshot boundary --
+    /// `ClusterConfig::default()` (empty voters, no `old_voters`) for a
+    /// fresh node with no snapshot yet.
+    pub fn snapshot_config(&self) -> &ClusterConfig {
+        &self.snapshot_config
+    }
+
+    /// Non-voting members this node (while leader) was tracking as of the
+    /// last `Effect::PersistLearners`.
+    pub fn learners(&self) -> &[NodeId] {
+        &self.learners
     }
 
     /// Records one effect as durable, synchronously. `Send` is not
@@ -113,26 +140,21 @@ impl Storage {
                 last_included_index,
                 last_included_term,
                 data,
-                // Real snapshot-config persistence in Storage/StorageState
-                // is separate, later cross-crate work, not this stage's
-                // job -- ignored here only to keep the workspace compiling
-                // against the widened Effect variant, same treatment as
-                // PersistLearners below.
-                config: _,
+                config,
             } => {
                 self.snapshot = SnapshotMetadata {
                     last_included_index: *last_included_index,
                     last_included_term: *last_included_term,
                 };
                 self.snapshot_data = data.clone();
+                self.snapshot_config = config.clone();
                 self.flush()
             }
             Effect::Send { .. } => Ok(()),
-            // Real learner-set persistence in Storage/StorageState is
-            // separate, later cross-crate work, not this stage's job --
-            // this arm exists only to keep the workspace compiling against
-            // the new Effect variant.
-            Effect::PersistLearners { .. } => Ok(()),
+            Effect::PersistLearners { learners } => {
+                self.learners = learners.clone();
+                self.flush()
+            }
         }
     }
 
@@ -144,6 +166,8 @@ impl Storage {
             snapshot_last_included_index: self.snapshot.last_included_index,
             snapshot_last_included_term: self.snapshot.last_included_term,
             snapshot_data: self.snapshot_data.clone(),
+            learners: self.learners.iter().map(|id| id.0).collect(),
+            snapshot_config: Some(configuration_to_proto(self.snapshot_config.clone())),
         };
 
         let mut file = fs::File::create(&self.path)?;
@@ -300,12 +324,58 @@ mod tests {
         );
         assert_eq!(reopened.snapshot_data(), &[9, 9]);
         assert_eq!(
+            reopened.snapshot_config(),
+            &ClusterConfig {
+                voters: vec![NodeId(1)],
+                old_voters: None,
+            },
+            "PersistSnapshot's config field must round-trip through StorageState, not just its \
+             boundary/term/bytes -- a restarting node that ignored this would fall back to an \
+             empty config and brick itself (see Node::recover's own preference for a real \
+             snapshot's config)"
+        );
+        assert_eq!(
             reopened.log(),
             &[LogEntry {
                 term: 1,
                 payload: LogPayload::Command(vec![4])
             }]
         );
+    }
+
+    #[test]
+    fn fresh_storage_has_no_learners_and_a_default_snapshot_config() {
+        let dir = tempdir().expect("temp dir");
+        let storage = Storage::open(dir.path().join("state")).expect("open storage");
+
+        assert!(storage.learners().is_empty());
+        assert_eq!(storage.snapshot_config(), &ClusterConfig::default());
+    }
+
+    #[test]
+    fn persist_learners_survives_a_reopen() {
+        let dir = tempdir().expect("temp dir");
+        let path = dir.path().join("state");
+
+        let mut storage = Storage::open(&path).expect("open storage");
+        storage
+            .apply(&Effect::PersistLearners {
+                learners: vec![NodeId(4), NodeId(5)],
+            })
+            .expect("persist learners");
+
+        let reopened = Storage::open(&path).expect("reopen storage");
+        assert_eq!(reopened.learners(), &[NodeId(4), NodeId(5)]);
+
+        // A later PersistLearners fully replaces the set, same as every
+        // other Persist* effect's splice-not-merge semantics.
+        storage
+            .apply(&Effect::PersistLearners {
+                learners: vec![NodeId(5)],
+            })
+            .expect("persist learners");
+        let reopened = Storage::open(&path).expect("reopen storage");
+        assert_eq!(reopened.learners(), &[NodeId(5)]);
     }
 
     #[test]

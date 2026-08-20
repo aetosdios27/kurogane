@@ -145,5 +145,16 @@ message StorageState {
   uint64 snapshot_last_included_index = 4;
   uint64 snapshot_last_included_term = 5;
   bytes snapshot_data = 6;
+  // Non-voting learners this node (while leader) was tracking -- see
+  // Effect::PersistLearners. Durable independently of hard state/log/
+  // snapshot timing, since a leader can add a learner between any two
+  // otherwise-unrelated persists.
+  repeated uint64 learners = 7;
+  // The membership active as of this snapshot's boundary -- see
+  // Effect::PersistSnapshot's `config` field. Absent (proto3 message
+  // fields have no separate "unset" the caller must round-trip through) on
+  // a fresh node with no snapshot yet; Storage treats a missing field the
+  // same as ClusterConfig::default().
+  Configuration snapshot_config = 8;
 }
 
