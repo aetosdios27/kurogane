@@ -1626,11 +1626,26 @@ impl Node {
         let last_included_term = self
             .term_at(up_to_index)
             .expect("a committed index is always present in the log or already the boundary");
-        // Capture the config active right now, before the drain -- once the
-        // compacted prefix is gone, snapshot_config is the only way a
-        // recovering node (or one that fell behind and needs InstallSnapshot)
-        // learns membership as of this boundary.
-        self.snapshot_config = self.current_config.clone();
+        // The config as of the new boundary is whatever the latest
+        // Configuration entry *within the drained prefix* says, not simply
+        // current_config as it stands right now: current_config may be
+        // established by an entry above up_to_index (config takes effect
+        // immediately, even before commit -- and up_to_index can be no
+        // higher than commit_index), which survives this drain but is
+        // still eligible to be truncated away later by a conflicting
+        // AppendEntries. If that later truncation happens, recompute_config
+        // falls back to snapshot_config -- which must hold the config that
+        // was actually true at this boundary, not one from an entry this
+        // compaction never touched and that turned out not to survive. If
+        // no Configuration entry falls within the drained prefix, the
+        // config at the new boundary is unchanged from the config at the
+        // old boundary, so snapshot_config is left exactly as it was.
+        let drained_prefix = &self.log[..=self.vec_index(up_to_index)];
+        if let Some((config, _)) =
+            latest_configuration_in(drained_prefix, self.snapshot.last_included_index)
+        {
+            self.snapshot_config = config;
+        }
         self.log.drain(0..=self.vec_index(up_to_index));
         self.snapshot = SnapshotMetadata {
             last_included_index: up_to_index,
@@ -4212,7 +4227,8 @@ mod tests {
     }
 
     #[test]
-    fn compact_captures_an_active_configuration_entry_into_the_snapshot() {
+    fn compact_leaves_snapshot_config_untouched_when_the_active_config_entry_is_above_the_boundary()
+    {
         let mut node = Node::new(NodeId(1), vec![NodeId(1)], 1, 1).expect("valid node");
         node.step(Event::Tick { next_timeout: 5 });
         node.propose(vec![1]);
@@ -4232,10 +4248,20 @@ mod tests {
         assert_eq!(node.current_config(), &joint_config);
         assert_eq!(node.commit_index(), 1);
 
-        // Compacting only through the still-committed index 1 -- the
-        // config entry at index 2 is untouched by the drain, but the
-        // snapshot must still capture the config that's live right now,
-        // exactly as compact()'s own doc comment says.
+        // Compacting only through the still-committed index 1 -- the joint
+        // config entry at index 2 is above this boundary and untouched by
+        // the drain, so the config *at the boundary being created* is the
+        // node's original bootstrap config, not the not-yet-committed
+        // joint one: snapshot_config must reflect that, not whatever
+        // current_config happens to be right now. If index 2 is later
+        // truncated away by a conflicting AppendEntries (it never
+        // committed, so it's legitimately discardable), snapshot_config is
+        // exactly what current_config falls back to -- it must not hold a
+        // config from an entry that turned out not to survive.
+        let bootstrap_config = ClusterConfig {
+            voters: vec![NodeId(1)],
+            old_voters: None,
+        };
         let effects = node.compact(1, vec![9]).expect("1 is committed");
 
         assert_eq!(
@@ -4245,7 +4271,7 @@ mod tests {
                     last_included_index: 1,
                     last_included_term: 1,
                     data: vec![9],
-                    config: joint_config.clone(),
+                    config: bootstrap_config,
                 },
                 Effect::PersistLog {
                     from_index: 2,
@@ -4259,6 +4285,67 @@ mod tests {
         // The config entry itself survived the drain (it's above the new
         // boundary), so current_config() is unaffected by compacting.
         assert_eq!(node.current_config(), &joint_config);
+    }
+
+    #[test]
+    fn a_config_entry_truncated_after_compaction_falls_back_to_the_boundarys_real_config_not_the_discarded_one()
+     {
+        // The scenario the fix above exists for: an uncommitted
+        // Configuration entry above the compaction boundary is later
+        // truncated away by a conflicting AppendEntries (a new leader's
+        // log didn't include it). current_config() must fall back to
+        // whatever config was genuinely active at the snapshot boundary --
+        // here, the original bootstrap config -- not the discarded entry's
+        // config, even though that entry was current_config() at the
+        // moment compact() ran.
+        let mut node = Node::new(NodeId(1), vec![NodeId(1)], 1, 1).expect("valid node");
+        node.step(Event::Tick { next_timeout: 5 });
+        node.propose(vec![1]);
+        assert_eq!(node.commit_index(), 1);
+
+        node.propose_config_change(vec![NodeId(1), NodeId(2)])
+            .expect("leader accepts propose_config_change");
+        assert_eq!(node.commit_index(), 1);
+
+        node.compact(1, vec![9]).expect("1 is committed");
+        assert_eq!(
+            node.current_config(),
+            &ClusterConfig {
+                voters: vec![NodeId(1), NodeId(2)],
+                old_voters: Some(vec![NodeId(1)]),
+            },
+            "the uncommitted config entry survives the drain, so it's still current"
+        );
+
+        // A conflicting AppendEntries from a legitimate higher-term leader
+        // (NodeId(2), already a voter under the joint config so it clears
+        // step()'s is_member check) truncates away the uncommitted config
+        // entry at index 2, replacing it with an ordinary command entry
+        // the majority actually agreed on instead.
+        node.step(Event::Step {
+            from: NodeId(2),
+            message: Message::AppendEntries(AppendEntries {
+                term: 2,
+                leader_id: NodeId(2),
+                prev_log_index: 1,
+                prev_log_term: 1,
+                entries: vec![LogEntry {
+                    term: 2,
+                    payload: LogPayload::Command(vec![2]),
+                }],
+                leader_commit: 1,
+            }),
+        });
+
+        assert_eq!(
+            node.current_config(),
+            &ClusterConfig {
+                voters: vec![NodeId(1)],
+                old_voters: None,
+            },
+            "falling back to snapshot_config after truncation must land on the \
+             boundary's real config, not the discarded entry's"
+        );
     }
 
     #[test]
