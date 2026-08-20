@@ -10,12 +10,22 @@ use kurogane_raft::{
 };
 
 /// Invalid construction of a deterministic cluster.
+///
+/// `MembershipMismatch`/`MissingNode` used to also live here, rejecting any
+/// cluster whose members' voter lists weren't byte-for-byte identical. Joint
+/// consensus makes that fundamentally the wrong check: nodes legitimately
+/// hold divergent config views mid-transition (a lagging follower's log may
+/// not yet have the joint entry the leader already applied), and `Cluster`
+/// routing (`Simulation::step`/`apply_effects`) is a pure `NodeId` ->
+/// `BTreeMap` lookup that never consults any node's config, so there was
+/// never a safety reason to require agreement up front. Dropped outright
+/// rather than narrowed, since every real invariant this was protecting
+/// (unique IDs, non-empty cluster) is still covered by the two variants
+/// below.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ClusterError {
     EmptyCluster,
     DuplicateNode(NodeId),
-    MembershipMismatch(NodeId),
-    MissingNode(NodeId),
 }
 
 impl fmt::Display for ClusterError {
@@ -24,18 +34,6 @@ impl fmt::Display for ClusterError {
             Self::EmptyCluster => formatter.write_str("cluster must contain at least one node"),
             Self::DuplicateNode(node) => {
                 write!(formatter, "cluster contains duplicate node {node:?}")
-            }
-            Self::MembershipMismatch(node) => {
-                write!(
-                    formatter,
-                    "node {node:?} has a different cluster membership"
-                )
-            }
-            Self::MissingNode(node) => {
-                write!(
-                    formatter,
-                    "cluster membership references missing node {node:?}"
-                )
             }
         }
     }
@@ -61,24 +59,6 @@ impl Cluster {
             let id = node.id();
             if by_id.insert(id, node).is_some() {
                 return Err(ClusterError::DuplicateNode(id));
-            }
-        }
-
-        let expected_members = by_id
-            .first_key_value()
-            .expect("non-empty cluster checked above")
-            .1
-            .voters()
-            .to_vec();
-
-        for node in by_id.values() {
-            if node.voters() != expected_members {
-                return Err(ClusterError::MembershipMismatch(node.id()));
-            }
-        }
-        for member in expected_members {
-            if !by_id.contains_key(&member) {
-                return Err(ClusterError::MissingNode(member));
             }
         }
 
@@ -405,23 +385,34 @@ mod tests {
     }
 
     #[test]
-    fn rejects_inconsistent_or_incomplete_membership() {
+    fn allows_divergent_or_incomplete_membership_views() {
+        // This is a deliberate behavior change, not a regression: Cluster::new
+        // used to reject any set of nodes whose voter lists weren't
+        // byte-for-byte identical (ClusterError::MembershipMismatch/
+        // MissingNode, both since removed). Joint consensus makes that check
+        // actively wrong -- nodes legitimately hold divergent config views
+        // mid-transition (a lagging follower's log may not yet have the
+        // joint entry the leader already applied), and routing
+        // (Simulation::step/apply_effects) is a pure NodeId -> BTreeMap
+        // lookup that never consults any node's config, so there was never a
+        // safety reason to require agreement up front.
         let shared = [NodeId(1), NodeId(2)];
         let different = [NodeId(1), NodeId(2), NodeId(3)];
-        let mismatch = Cluster::new(vec![
+        let divergent = Cluster::new(vec![
             node(1, &shared),
             node(2, &different),
             node(3, &different),
         ]);
-        assert_eq!(
-            mismatch.expect_err("memberships must match"),
-            ClusterError::MembershipMismatch(NodeId(2))
+        assert!(
+            divergent.is_ok(),
+            "divergent membership views must be accepted, not rejected"
         );
 
         let incomplete = Cluster::new(vec![node(1, &shared)]);
-        assert_eq!(
-            incomplete.expect_err("all members must be present"),
-            ClusterError::MissingNode(NodeId(2))
+        assert!(
+            incomplete.is_ok(),
+            "a node whose own voter list names an absent member must be accepted -- \
+             Cluster::new doesn't consult any node's config at all"
         );
     }
 
