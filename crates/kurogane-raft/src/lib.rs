@@ -262,7 +262,6 @@ impl Error for CompactError {}
 #[derive(Debug)]
 pub struct Node {
     id: NodeId,
-    peers: Vec<NodeId>,
     role: Role,
     current_term: u64,
     voted_for: Option<NodeId>,
@@ -279,11 +278,29 @@ pub struct Node {
     /// Opaque bytes for `snapshot`, kept around so a leader can resend them
     /// via `InstallSnapshot` without asking its owner for them again.
     snapshot_data: Vec<u8>,
-    /// The configuration active as of `snapshot`'s boundary — inert
-    /// bookkeeping for now (nothing reads it yet; the constructor's
-    /// `peers` argument, wrapped as a stable config, is still the sole
-    /// source of truth for membership at this stage of the milestone).
+    /// The configuration active as of `snapshot`'s boundary — the fallback
+    /// `current_config` resolves to once no `Configuration` entry remains
+    /// in `log` (either because none was ever appended, or because
+    /// `compact` drained the one that was).
     snapshot_config: ClusterConfig,
+    /// The configuration currently governing quorum and voting eligibility:
+    /// the most recent `Configuration` entry found scanning `log`
+    /// backward, or `snapshot_config` if none remains. Live the instant a
+    /// `Configuration` entry is appended, even before it commits — Raft's
+    /// membership rule, not an oversight — so this is recomputed after
+    /// every mutation that can change what "latest" means (`propose`'s
+    /// append, `on_append_entries`'s merge/truncate, and `compact`'s
+    /// drain), never read lazily.
+    current_config: ClusterConfig,
+}
+
+/// The most recent `Configuration` payload in `log`, scanning backward, or
+/// `None` if every entry (if any) is a `Command`.
+fn latest_configuration_in(log: &[LogEntry]) -> Option<ClusterConfig> {
+    log.iter().rev().find_map(|entry| match &entry.payload {
+        LogPayload::Configuration(config) => Some(config.clone()),
+        LogPayload::Command(_) => None,
+    })
 }
 
 impl Node {
@@ -345,13 +362,14 @@ impl Node {
         }
 
         let snapshot_config = ClusterConfig {
-            voters: peers.clone(),
+            voters: peers,
             old_voters: None,
         };
+        let current_config =
+            latest_configuration_in(&log).unwrap_or_else(|| snapshot_config.clone());
 
         Ok(Self {
             id,
-            peers,
             role: Role::Follower,
             current_term: hard_state.current_term,
             voted_for: hard_state.voted_for,
@@ -367,6 +385,7 @@ impl Node {
             snapshot: snapshot.metadata,
             snapshot_data: snapshot.data,
             snapshot_config,
+            current_config,
         })
     }
 
@@ -374,8 +393,28 @@ impl Node {
         self.id
     }
 
-    pub fn peers(&self) -> &[NodeId] {
-        &self.peers
+    /// The configuration currently governing quorum and voting eligibility
+    /// — see the field doc comment on `Node::current_config` for exactly
+    /// when this changes.
+    pub fn current_config(&self) -> &ClusterConfig {
+        &self.current_config
+    }
+
+    /// The active voter set under `current_config()`. A direct drop-in for
+    /// callers that only ever want a flat member list (most callers, most
+    /// of the time, since `old_voters` is `None` outside a joint-consensus
+    /// transition) — use `current_config()` directly when the full shape,
+    /// including a possible `old_voters`, actually matters.
+    pub fn voters(&self) -> &[NodeId] {
+        &self.current_config.voters
+    }
+
+    /// Recomputes `current_config` from scratch: the latest `Configuration`
+    /// entry in `log`, or `snapshot_config` if none remains. Called after
+    /// every mutation that can change what "latest" means.
+    fn recompute_config(&mut self) {
+        self.current_config =
+            latest_configuration_in(&self.log).unwrap_or_else(|| self.snapshot_config.clone());
     }
 
     pub fn role(&self) -> Role {
@@ -437,10 +476,9 @@ impl Node {
         &self.snapshot_data
     }
 
-    /// The configuration active as of the current snapshot boundary. Inert
-    /// bookkeeping so far — `current_config()` (added once membership is
-    /// derived from the log rather than the constructor's fixed `peers`)
-    /// will be the one callers actually want.
+    /// The configuration active as of the current snapshot boundary —
+    /// `current_config()`'s fallback once no `Configuration` entry remains
+    /// in `log`. Most callers want `current_config()`, not this.
     pub fn snapshot_config(&self) -> &ClusterConfig {
         &self.snapshot_config
     }
@@ -489,7 +527,7 @@ impl Node {
     }
 
     fn is_member(&self, id: NodeId) -> bool {
-        self.peers.binary_search(&id).is_ok()
+        self.current_config.is_voter(id)
     }
 
     /// Position of absolute `index` within `log`. Callers must ensure
@@ -595,7 +633,8 @@ impl Node {
     }
 
     fn broadcast_replication(&self) -> Vec<Effect> {
-        self.peers
+        self.current_config
+            .voters
             .iter()
             .copied()
             .filter(|&peer| peer != self.id)
@@ -617,7 +656,12 @@ impl Node {
         let next_index = self.last_log_index() + 1;
         self.next_index.clear();
         self.match_index.clear();
-        for &peer in self.peers.iter().filter(|&&peer| peer != self.id) {
+        for &peer in self
+            .current_config
+            .voters
+            .iter()
+            .filter(|&&peer| peer != self.id)
+        {
             self.next_index.insert(peer, next_index);
             self.match_index.insert(peer, 0);
         }
@@ -645,7 +689,8 @@ impl Node {
         }
 
         effects.extend(
-            self.peers
+            self.current_config
+                .voters
                 .iter()
                 .copied()
                 .filter(|&peer| peer != self.id)
@@ -809,6 +854,9 @@ impl Node {
                     }
                 }
             }
+        }
+        if log_changed_from.is_some() {
+            self.recompute_config();
         }
 
         if request.leader_commit > self.commit_index {
@@ -1007,7 +1055,8 @@ impl Node {
     /// indirectly once a current-term entry at or after it does.
     fn advance_commit_index(&mut self) {
         let mut match_indices: Vec<u64> = self
-            .peers
+            .current_config
+            .voters
             .iter()
             .copied()
             .map(|peer| {
@@ -1023,7 +1072,7 @@ impl Node {
             .collect();
         match_indices.sort_unstable();
 
-        let candidate = match_indices[self.peers.len() - self.quorum_size()];
+        let candidate = match_indices[self.current_config.voters.len() - self.quorum_size()];
         if candidate > self.commit_index && self.term_at(candidate) == Some(self.current_term) {
             self.commit_index = candidate;
         }
@@ -1043,6 +1092,7 @@ impl Node {
             payload: LogPayload::Command(command),
         };
         self.log.push(entry.clone());
+        self.recompute_config();
         let index = self.last_log_index();
         self.advance_commit_index();
 
@@ -1083,12 +1133,18 @@ impl Node {
         let last_included_term = self
             .term_at(up_to_index)
             .expect("a committed index is always present in the log or already the boundary");
+        // Capture the config active right now, before the drain -- once the
+        // compacted prefix is gone, snapshot_config is the only way a
+        // recovering node (or one that fell behind and needs InstallSnapshot)
+        // learns membership as of this boundary.
+        self.snapshot_config = self.current_config.clone();
         self.log.drain(0..=self.vec_index(up_to_index));
         self.snapshot = SnapshotMetadata {
             last_included_index: up_to_index,
             last_included_term,
         };
         self.snapshot_data = snapshot_data.clone();
+        self.recompute_config();
 
         Ok(vec![
             Effect::PersistSnapshot {
@@ -1118,7 +1174,7 @@ impl Node {
     }
 
     fn quorum_size(&self) -> usize {
-        self.peers.len() / 2 + 1
+        self.current_config.voters.len() / 2 + 1
     }
 
     fn has_quorum(&self) -> bool {
@@ -1142,7 +1198,14 @@ mod tests {
         let node = Node::new(NodeId(2), peers.clone(), 11, 4).expect("valid configuration");
 
         assert_eq!(node.id(), NodeId(2));
-        assert_eq!(node.peers(), peers);
+        assert_eq!(node.voters(), peers);
+        assert_eq!(
+            node.current_config(),
+            &ClusterConfig {
+                voters: peers.clone(),
+                old_voters: None,
+            }
+        );
         assert_eq!(
             node.snapshot_config(),
             &ClusterConfig {

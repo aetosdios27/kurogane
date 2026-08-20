@@ -67,11 +67,11 @@ impl Cluster {
             .first_key_value()
             .expect("non-empty cluster checked above")
             .1
-            .peers()
+            .voters()
             .to_vec();
 
         for node in by_id.values() {
-            if node.peers() != expected_members {
+            if node.voters() != expected_members {
                 return Err(ClusterError::MembershipMismatch(node.id()));
             }
         }
