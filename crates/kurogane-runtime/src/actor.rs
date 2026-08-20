@@ -6,7 +6,7 @@
 use std::io;
 
 use kurogane_kv::{ApplyResult, Command, Replica, StateMachine};
-use kurogane_raft::{Effect, Event, Message, Node, NodeId};
+use kurogane_raft::{Effect, Event, Message, Node, NodeId, Role};
 
 use crate::storage::Storage;
 
@@ -17,15 +17,40 @@ use crate::storage::Storage;
 /// cycle) is what actually guarantees eventual delivery, not this trait.
 pub trait PeerTransport {
     fn send(&mut self, to: NodeId, message: Message);
+
+    /// Registers (or replaces) one peer's outbound address, e.g. once a
+    /// real `AddLearner` RPC introduces a new server this node didn't know
+    /// about at startup. Defaults to a no-op that reports success: a
+    /// transport that routes by some other means (or a test double that
+    /// never needs a real connection) shouldn't have to implement this just
+    /// to compile. Returns whether `address` was accepted as reachable.
+    fn add_peer(&mut self, _id: NodeId, _address: String) -> bool {
+        true
+    }
 }
 
-/// The result of a `propose` call: accepted at this log index, or a
-/// redirect hint (if one is known) when this node isn't the leader.
-/// Carrying the hint here means a rejected client doesn't need a second
-/// round trip just to ask who the leader is.
+/// The result of a `propose` or `propose_config_change` call: accepted at
+/// this log index, or a redirect hint (if one is known) when this node
+/// isn't the leader. Carrying the hint here means a rejected client doesn't
+/// need a second round trip just to ask who the leader is. Shared between
+/// the two calls since both mirror the exact same "index or redirect"
+/// shape at the `Node` layer.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ProposeOutcome {
     Accepted(u64),
+    NotLeader(Option<NodeId>),
+}
+
+/// The result of an `add_learner` call. Unlike `ProposeOutcome`, there's no
+/// log index to report -- `Node::add_learner` doesn't append anything --
+/// so `Accepted` instead carries whether the transport accepted `address`
+/// as a valid endpoint. That's a distinct concern from whether the learner
+/// has actually caught up yet, which the caller must poll for separately
+/// (e.g. via its own storage file, the way this project's tests already do
+/// for ordinary replication catch-up).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AddLearnerOutcome {
+    Accepted { connected: bool },
     NotLeader(Option<NodeId>),
 }
 
@@ -142,6 +167,59 @@ impl<T: PeerTransport> Actor<T> {
         Ok(ProposeOutcome::Accepted(index))
     }
 
+    /// Begins a joint-consensus transition to `new_voters` if this node is
+    /// the leader, mirroring `propose` exactly.
+    pub fn propose_config_change(&mut self, new_voters: Vec<NodeId>) -> io::Result<ProposeOutcome> {
+        let Some((index, effects)) = self.replica.propose_config_change(new_voters) else {
+            return Ok(ProposeOutcome::NotLeader(self.leader_hint));
+        };
+        self.dispatch(effects)?;
+        self.maybe_compact()?;
+        Ok(ProposeOutcome::Accepted(index))
+    }
+
+    /// Registers `id` as a non-voting learner reachable at `address`, if
+    /// this node is the leader.
+    ///
+    /// Order is deliberate: the raft-level registration (and its durable
+    /// `PersistLearners`) happens *before* the transport is wired up. A
+    /// crash between the two steps then leaves, at worst, a
+    /// registered-but-unreachable learner -- harmless, since ordinary
+    /// replication retries simply keep failing to reach it until an
+    /// operator retries `AddLearner`. The reverse order would risk a
+    /// reachable transport target that the raft layer's durable state never
+    /// accounted for, which is the worse failure mode: traffic could reach
+    /// a node nothing durable explains it being sent to.
+    ///
+    /// `Node::add_learner` returns empty effects for three different
+    /// reasons (not leader, already tracked, already a voter) -- only the
+    /// first is a real `NotLeader`, so role is checked explicitly rather
+    /// than inferred from an empty effects list, or a legitimate idempotent
+    /// retry against the real leader would misreport itself as a redirect.
+    pub fn add_learner(&mut self, id: NodeId, address: String) -> io::Result<AddLearnerOutcome> {
+        if self.replica.node().role() != Role::Leader {
+            return Ok(AddLearnerOutcome::NotLeader(self.leader_hint));
+        }
+
+        let effects = self.replica.add_learner(id);
+        self.dispatch(effects)?;
+        self.maybe_compact()?;
+
+        let connected = self.transport.add_peer(id, address);
+        Ok(AddLearnerOutcome::Accepted { connected })
+    }
+
+    /// Stops tracking `id` as a learner, if this node is the leader. No
+    /// gRPC surface exposes this yet (promotion via `propose_config_change`
+    /// already drops a promoted learner on its own) -- kept here for parity
+    /// with `add_learner`/`propose_config_change` and as the natural place
+    /// for future operator tooling to hang off.
+    pub fn remove_learner(&mut self, id: NodeId) -> io::Result<()> {
+        let effects = self.replica.remove_learner(id);
+        self.dispatch(effects)?;
+        self.maybe_compact()
+    }
+
     fn update_leader_hint(&mut self, from: NodeId, message: &Message) {
         // Both a real AppendEntries and an InstallSnapshot are equally
         // good evidence of who's leading; mirrors on_append_entries's own
@@ -182,17 +260,13 @@ impl<T: PeerTransport> Actor<T> {
             match effect {
                 Effect::PersistHardState { .. }
                 | Effect::PersistLog { .. }
-                | Effect::PersistSnapshot { .. } => {
+                | Effect::PersistSnapshot { .. }
+                | Effect::PersistLearners { .. } => {
                     self.storage.apply(effect)?;
                 }
                 Effect::Send { to, message } => {
                     self.transport.send(*to, message.clone());
                 }
-                // Real learner-set persistence/wiring here is separate,
-                // later cross-crate work, not this stage's job -- this arm
-                // exists only to keep the workspace compiling against the
-                // new Effect variant.
-                Effect::PersistLearners { .. } => {}
             }
         }
         Ok(())
@@ -216,6 +290,19 @@ enum ActorRequest {
     Propose {
         command: Command,
         reply: tokio::sync::oneshot::Sender<ProposeOutcome>,
+    },
+    ProposeConfigChange {
+        new_voters: Vec<NodeId>,
+        reply: tokio::sync::oneshot::Sender<ProposeOutcome>,
+    },
+    AddLearner {
+        id: NodeId,
+        address: String,
+        reply: tokio::sync::oneshot::Sender<AddLearnerOutcome>,
+    },
+    RemoveLearner {
+        id: NodeId,
+        reply: tokio::sync::oneshot::Sender<()>,
     },
 }
 
@@ -273,6 +360,42 @@ impl ActorHandle {
     pub fn tick(&self, next_timeout: u64) {
         let _ = self.sender.try_send(ActorRequest::Tick { next_timeout });
     }
+
+    /// Submits a client config-change request and awaits its result. `None`
+    /// means the actor task is gone; otherwise the outcome carries either
+    /// the accepted index or a leader hint for redirection, same shape as
+    /// `propose`.
+    pub async fn propose_config_change(&self, new_voters: Vec<NodeId>) -> Option<ProposeOutcome> {
+        let (reply, receiver) = tokio::sync::oneshot::channel();
+        self.sender
+            .send(ActorRequest::ProposeConfigChange { new_voters, reply })
+            .await
+            .ok()?;
+        receiver.await.ok()
+    }
+
+    /// Submits a client `AddLearner` request and awaits its result. `None`
+    /// means the actor task is gone.
+    pub async fn add_learner(&self, id: NodeId, address: String) -> Option<AddLearnerOutcome> {
+        let (reply, receiver) = tokio::sync::oneshot::channel();
+        self.sender
+            .send(ActorRequest::AddLearner { id, address, reply })
+            .await
+            .ok()?;
+        receiver.await.ok()
+    }
+
+    /// Submits a `RemoveLearner` request and awaits its completion. `None`
+    /// means the actor task is gone. No gRPC surface calls this yet -- see
+    /// `Actor::remove_learner`'s own doc comment.
+    pub async fn remove_learner(&self, id: NodeId) -> Option<()> {
+        let (reply, receiver) = tokio::sync::oneshot::channel();
+        self.sender
+            .send(ActorRequest::RemoveLearner { id, reply })
+            .await
+            .ok()?;
+        receiver.await.ok()
+    }
 }
 
 /// The receiving half of an actor's channel. Opaque on purpose — only
@@ -322,6 +445,24 @@ pub async fn run<T: PeerTransport>(mut actor: Actor<T>, mut requests: ActorRecei
                     .propose(command)
                     .expect("durable storage write must succeed");
                 let _ = reply.send(result);
+            }
+            ActorRequest::ProposeConfigChange { new_voters, reply } => {
+                let result = actor
+                    .propose_config_change(new_voters)
+                    .expect("durable storage write must succeed");
+                let _ = reply.send(result);
+            }
+            ActorRequest::AddLearner { id, address, reply } => {
+                let result = actor
+                    .add_learner(id, address)
+                    .expect("durable storage write must succeed");
+                let _ = reply.send(result);
+            }
+            ActorRequest::RemoveLearner { id, reply } => {
+                actor
+                    .remove_learner(id)
+                    .expect("durable storage write must succeed");
+                let _ = reply.send(());
             }
         }
     }

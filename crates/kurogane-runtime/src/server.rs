@@ -3,14 +3,16 @@
 
 use tonic::{Request, Response, Status};
 
-use crate::actor::{ActorHandle, ProposeOutcome};
+use crate::actor::{ActorHandle, AddLearnerOutcome, ProposeOutcome};
 use crate::dto;
 use crate::proto::raft_client_server::RaftClient;
 use crate::proto::raft_peer_server::RaftPeer;
 use crate::proto::{
-    AppendEntriesReply, AppendEntriesRequest, InstallSnapshotReply, InstallSnapshotRequest,
-    NotLeader, ProposeAccepted, ProposeReply, ProposeRequest, RequestVoteReply, RequestVoteRequest,
-    propose_reply,
+    AddLearnerAccepted, AddLearnerReply, AddLearnerRequest, AppendEntriesReply,
+    AppendEntriesRequest, InstallSnapshotReply, InstallSnapshotRequest, NotLeader, ProposeAccepted,
+    ProposeConfigChangeAccepted, ProposeConfigChangeReply, ProposeConfigChangeRequest,
+    ProposeReply, ProposeRequest, RequestVoteReply, RequestVoteRequest, add_learner_reply,
+    propose_config_change_reply, propose_reply,
 };
 use kurogane_raft::Message;
 
@@ -138,6 +140,58 @@ impl RaftClient for RaftClientService {
             }),
         };
         Ok(Response::new(ProposeReply {
+            result: Some(result),
+        }))
+    }
+
+    async fn propose_config_change(
+        &self,
+        request: Request<ProposeConfigChangeRequest>,
+    ) -> Result<Response<ProposeConfigChangeReply>, Status> {
+        let new_voters = dto::propose_config_change_from_proto(request.into_inner());
+
+        let outcome = self
+            .actor
+            .propose_config_change(new_voters)
+            .await
+            .ok_or_else(|| Status::unavailable("actor task is not running"))?;
+
+        let result = match outcome {
+            ProposeOutcome::Accepted(index) => {
+                propose_config_change_reply::Result::Accepted(ProposeConfigChangeAccepted { index })
+            }
+            ProposeOutcome::NotLeader(hint) => {
+                propose_config_change_reply::Result::NotLeader(NotLeader {
+                    leader_id: hint.map(|id| id.0),
+                })
+            }
+        };
+        Ok(Response::new(ProposeConfigChangeReply {
+            result: Some(result),
+        }))
+    }
+
+    async fn add_learner(
+        &self,
+        request: Request<AddLearnerRequest>,
+    ) -> Result<Response<AddLearnerReply>, Status> {
+        let (id, address) = dto::add_learner_from_proto(request.into_inner());
+
+        let outcome = self
+            .actor
+            .add_learner(id, address)
+            .await
+            .ok_or_else(|| Status::unavailable("actor task is not running"))?;
+
+        let result = match outcome {
+            AddLearnerOutcome::Accepted { .. } => {
+                add_learner_reply::Result::Accepted(AddLearnerAccepted {})
+            }
+            AddLearnerOutcome::NotLeader(hint) => add_learner_reply::Result::NotLeader(NotLeader {
+                leader_id: hint.map(|id| id.0),
+            }),
+        };
+        Ok(Response::new(AddLearnerReply {
             result: Some(result),
         }))
     }

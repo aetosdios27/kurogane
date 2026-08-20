@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt;
 
-use kurogane_raft::{Effect, Event, LogPayload, Node};
+use kurogane_raft::{Effect, Event, LogPayload, Node, NodeId};
 
 /// A client operation against the replicated key/value state machine.
 /// `Get` is a command, not a side-channel read: routing it through the log
@@ -287,6 +287,37 @@ impl Replica {
 
     pub fn step(&mut self, event: Event) -> Vec<Effect> {
         let effects = self.node.step(event);
+        self.drain_committed();
+        effects
+    }
+
+    /// Begins a joint-consensus transition to `new_voters` if this
+    /// replica's node is the leader, returning the resulting `Configuration`
+    /// entry's log index and the effects needed to make it durable. Mirrors
+    /// `propose`'s exact shape -- see `Node::propose_config_change`'s own
+    /// doc comment for everything past this one call (the automatic
+    /// `C_old,new` -> `C_new` follow-up and any resulting leader step-down
+    /// are driven entirely by commit advancement, not a second call here).
+    pub fn propose_config_change(&mut self, new_voters: Vec<NodeId>) -> Option<(u64, Vec<Effect>)> {
+        let (index, effects) = self.node.propose_config_change(new_voters)?;
+        self.drain_committed();
+        Some((index, effects))
+    }
+
+    /// Starts tracking `id` as a non-voting learner if this replica's node
+    /// is the leader -- see `Node::add_learner`'s own doc comment for the
+    /// exact no-op conditions (not leader, already tracked, already a
+    /// voter).
+    pub fn add_learner(&mut self, id: NodeId) -> Vec<Effect> {
+        let effects = self.node.add_learner(id);
+        self.drain_committed();
+        effects
+    }
+
+    /// Stops tracking `id` as a learner -- see `Node::remove_learner`'s own
+    /// doc comment for the exact no-op conditions.
+    pub fn remove_learner(&mut self, id: NodeId) -> Vec<Effect> {
+        let effects = self.node.remove_learner(id);
         self.drain_committed();
         effects
     }

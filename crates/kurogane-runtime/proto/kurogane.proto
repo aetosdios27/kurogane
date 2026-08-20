@@ -127,8 +127,54 @@ message NotLeader {
   optional uint64 leader_id = 1;
 }
 
+// Begins a joint-consensus transition to `voters` (mirrors
+// Node::propose_config_change's own parameter) -- the automatic
+// C_old,new -> C_new follow-up and any resulting leader step-down happen
+// entirely on their own, driven by ordinary commit advancement, not by any
+// second RPC.
+message ProposeConfigChangeRequest {
+  repeated uint64 voters = 1;
+}
+
+message ProposeConfigChangeReply {
+  oneof result {
+    ProposeConfigChangeAccepted accepted = 1;
+    NotLeader not_leader = 2;
+  }
+}
+
+message ProposeConfigChangeAccepted {
+  uint64 index = 1;
+}
+
+// Registers `node_id` as a non-voting learner with the current leader, so
+// it starts receiving ordinary replication without being counted toward
+// any quorum -- the safe on-ramp for a genuinely new server (see
+// Node::add_learner's doc comment). `address` is this new server's gRPC
+// endpoint, needed so the leader's transport can actually reach it; a
+// join-mode node doesn't announce itself, since it doesn't yet know it's
+// been admitted to anything.
+message AddLearnerRequest {
+  uint64 node_id = 1;
+  string address = 2;
+}
+
+message AddLearnerReply {
+  oneof result {
+    AddLearnerAccepted accepted = 1;
+    NotLeader not_leader = 2;
+  }
+}
+
+// No fields: Node::add_learner has nothing meaningful to report back
+// beyond having accepted the request (unlike Propose, there's no log
+// index a client would ever want to poll for here).
+message AddLearnerAccepted {}
+
 service RaftClient {
   rpc Propose(ProposeRequest) returns (ProposeReply);
+  rpc ProposeConfigChange(ProposeConfigChangeRequest) returns (ProposeConfigChangeReply);
+  rpc AddLearner(AddLearnerRequest) returns (AddLearnerReply);
 }
 
 // On-disk durable state. Not part of any RPC -- reused here rather than

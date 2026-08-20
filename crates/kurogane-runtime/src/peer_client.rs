@@ -43,6 +43,26 @@ impl GrpcPeerTransport {
 }
 
 impl PeerTransport for GrpcPeerTransport {
+    /// Registers (or replaces) one peer's outbound address, mirroring
+    /// exactly what `new()` does per entry -- a lazy connection, established
+    /// on first actual use, not here. Unlike `new()`'s `.expect()`, this
+    /// must not panic on a bad address: `address` arrives over the wire
+    /// from a client's `AddLearner` RPC, inside the actor task, so a
+    /// malformed string here must fail the one request, not take the whole
+    /// node down. Returns whether `address` was a valid URI.
+    ///
+    /// No interior mutability needed for `&mut self` to be safe here: this
+    /// transport lives exclusively inside the one Tokio task that owns the
+    /// `Actor`, and `send` already takes `&mut self`.
+    fn add_peer(&mut self, id: NodeId, address: String) -> bool {
+        let Ok(endpoint) = Endpoint::from_shared(address) else {
+            return false;
+        };
+        self.clients
+            .insert(id, RaftPeerClient::new(endpoint.connect_lazy()));
+        true
+    }
+
     fn send(&mut self, to: NodeId, message: Message) {
         let Some(client) = self.clients.get(&to).cloned() else {
             return;

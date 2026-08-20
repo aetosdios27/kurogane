@@ -193,6 +193,31 @@ pub fn install_snapshot_response_to_proto(
     }
 }
 
+pub fn propose_config_change_from_proto(proto: proto::ProposeConfigChangeRequest) -> Vec<NodeId> {
+    proto.voters.into_iter().map(NodeId).collect()
+}
+
+pub fn propose_config_change_to_proto(voters: Vec<NodeId>) -> proto::ProposeConfigChangeRequest {
+    proto::ProposeConfigChangeRequest {
+        voters: voters.into_iter().map(|id| id.0).collect(),
+    }
+}
+
+/// `(id, address)` -- this RPC has no `kurogane-raft`/`kurogane-kv` core
+/// type to mirror (unlike every other pair in this file): `address` is a
+/// purely runtime-level, transport-reachability concept `Node::add_learner`
+/// itself has no notion of.
+pub fn add_learner_from_proto(proto: proto::AddLearnerRequest) -> (NodeId, String) {
+    (NodeId(proto.node_id), proto.address)
+}
+
+pub fn add_learner_to_proto(id: NodeId, address: String) -> proto::AddLearnerRequest {
+    proto::AddLearnerRequest {
+        node_id: id.0,
+        address,
+    }
+}
+
 /// A `Command` message with no `kind` set — malformed input, since every
 /// legitimate caller sets exactly one.
 #[derive(Debug)]
@@ -426,6 +451,27 @@ mod tests {
         assert_eq!(
             log_entry_from_proto(log_entry_to_proto(value.clone())).expect("payload is set"),
             value
+        );
+    }
+
+    #[test]
+    fn round_trips_a_propose_config_change_request() {
+        let value = vec![NodeId(1), NodeId(2), NodeId(4)];
+
+        assert_eq!(
+            propose_config_change_from_proto(propose_config_change_to_proto(value.clone())),
+            value
+        );
+    }
+
+    #[test]
+    fn round_trips_an_add_learner_request() {
+        let id = NodeId(4);
+        let address = "http://127.0.0.1:50054".to_string();
+
+        assert_eq!(
+            add_learner_from_proto(add_learner_to_proto(id, address.clone())),
+            (id, address)
         );
     }
 
