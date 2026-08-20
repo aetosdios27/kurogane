@@ -122,6 +122,11 @@ impl Storage {
                 self.flush()
             }
             Effect::Send { .. } => Ok(()),
+            // Real learner-set persistence in Storage/StorageState is
+            // separate, later cross-crate work, not this stage's job --
+            // this arm exists only to keep the workspace compiling against
+            // the new Effect variant.
+            Effect::PersistLearners { .. } => Ok(()),
         }
     }
 

@@ -174,6 +174,19 @@ pub enum Effect {
         last_included_term: u64,
         data: Vec<u8>,
     },
+    /// Replaces the durable learner set with `learners`. A separate effect
+    /// from `PersistSnapshot` rather than folded into it: the learner set
+    /// changes independently of snapshot/compaction timing (via
+    /// `add_learner`/`remove_learner`), so tying its durability to
+    /// whenever a compaction happens to occur would mean a freshly added
+    /// learner could be lost on a leader crash long before the next
+    /// compaction ever runs. A fresh joiner's own empty storage has
+    /// nothing else to tell it what it is, so this is genuinely durable
+    /// state, not leader-local bookkeeping. Same before-any-dependent-Send
+    /// ordering guarantee as the others.
+    PersistLearners {
+        learners: Vec<NodeId>,
+    },
 }
 
 /// The subset of a node's state that must survive a crash: its current term
@@ -302,6 +315,14 @@ pub struct Node {
     /// `C_old,new` -> `C_new` follow-up and the not-in-`C_new` leader
     /// step-down.
     current_config_index: u64,
+    /// Non-voting members this node (while leader) replicates to but never
+    /// counts toward any quorum -- how a new server joins with an empty
+    /// log without being able to disrupt the cluster (§6). Durably
+    /// persisted via `Effect::PersistLearners`, independent of
+    /// `current_config`/`snapshot_config`: promotion to a voter is a
+    /// separate, explicit `propose_config_change` call, not implied by
+    /// membership here.
+    learners: BTreeSet<NodeId>,
 }
 
 /// The most recent `Configuration` payload in `log`, scanning backward,
@@ -352,6 +373,7 @@ impl Node {
             HardState::default(),
             Vec::new(),
             Snapshot::default(),
+            Vec::new(),
         )
     }
 
@@ -364,6 +386,15 @@ impl Node {
     /// built from already-committed data, so that much of `commit_index`
     /// *is* recoverable fact, not state to re-derive. Everything above that
     /// point is still safely re-derived through normal replication.
+    ///
+    /// `learners` joins the parameter list as durable state alongside
+    /// `hard_state`/`log`/`snapshot`, not bundled into any one of them:
+    /// it's persisted independently via `Effect::PersistLearners`, on its
+    /// own schedule, not tied to hard-state or snapshot timing.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "mirrors HardState/log/Snapshot's own flat parameters -- see the doc comment"
+    )]
     pub fn recover(
         id: NodeId,
         peers: Vec<NodeId>,
@@ -372,6 +403,7 @@ impl Node {
         hard_state: HardState,
         log: Vec<LogEntry>,
         snapshot: Snapshot,
+        learners: Vec<NodeId>,
     ) -> Result<Self, ConfigError> {
         if peers.is_empty() {
             return Err(ConfigError::EmptyConfiguration);
@@ -425,6 +457,7 @@ impl Node {
             snapshot_config,
             current_config,
             current_config_index,
+            learners: learners.into_iter().collect(),
         })
     }
 
@@ -531,6 +564,12 @@ impl Node {
         &self.snapshot_config
     }
 
+    /// Non-voting members currently tracked for replication -- see the
+    /// field doc comment on `Node::learners`.
+    pub fn learners(&self) -> &BTreeSet<NodeId> {
+        &self.learners
+    }
+
     /// Applies one explicit input to this node's protocol state, returning the
     /// effects its owner must interpret (e.g. sending a message to a peer).
     pub fn step(&mut self, event: Event) -> Vec<Effect> {
@@ -574,8 +613,18 @@ impl Node {
         }
     }
 
+    /// Whether `id` is trusted as a sender at `step()`'s message-dispatch
+    /// choke point: a voter under `current_config` (voters ∪ old_voters)
+    /// or a tracked learner. The learner half matters specifically for a
+    /// leader (or any node) receiving a message *from* a learner -- e.g.
+    /// an `AppendEntriesResponse` from a learner catching up -- without it,
+    /// that response's `from` would fail this check and get silently
+    /// dropped by `step()`, permanently stalling the learner's progress
+    /// tracking. (A learner's own incoming `AppendEntries` *from* its
+    /// leader already passes today, since the leader is always a voter --
+    /// this widening is about the reverse direction.)
     fn is_member(&self, id: NodeId) -> bool {
-        self.current_config.is_voter(id)
+        self.current_config.is_voter(id) || self.learners.contains(&id)
     }
 
     /// Position of absolute `index` within `log`. Callers must ensure
@@ -680,12 +729,28 @@ impl Node {
         self.log[self.vec_index(index)..].to_vec()
     }
 
-    fn broadcast_replication(&self) -> Vec<Effect> {
+    /// The union of every peer this node, as leader, owes ordinary
+    /// replication to: `current_config.voters` ∪ `current_config.old_voters`
+    /// ∪ `learners`, minus itself. A `BTreeSet` naturally dedupes a peer
+    /// that's a member of more than one of those sets at once (e.g.
+    /// present in both `voters` and `old_voters` mid-transition, or --
+    /// less likely, but defensive against caller misuse -- both `learners`
+    /// and a voter set). `self.id` is filtered defensively even though it
+    /// should never legitimately appear in `learners`.
+    fn replication_targets(&self) -> BTreeSet<NodeId> {
         self.current_config
             .voters
             .iter()
             .copied()
+            .chain(self.current_config.old_voters.iter().flatten().copied())
+            .chain(self.learners.iter().copied())
             .filter(|&peer| peer != self.id)
+            .collect()
+    }
+
+    fn broadcast_replication(&self) -> Vec<Effect> {
+        self.replication_targets()
+            .into_iter()
             .map(|peer| self.replicate_to(peer))
             .collect()
     }
@@ -697,6 +762,10 @@ impl Node {
     /// peer's `next_index` is freshly seeded to `last_log_index() + 1`,
     /// strictly above the snapshot boundary — but a later back-off on
     /// conflict can still push it down to `InstallSnapshot` territory.
+    /// Seeds over `replication_targets()` (voters ∪ old_voters ∪
+    /// learners), not just `current_config.voters` -- an old-set-only
+    /// voter or a learner that responds before the first ordinary
+    /// `broadcast_replication` sweep still needs a tracked entry to update.
     fn become_leader(&mut self) -> Vec<Effect> {
         self.role = Role::Leader;
         self.heartbeat_elapsed = 0;
@@ -704,12 +773,7 @@ impl Node {
         let next_index = self.last_log_index() + 1;
         self.next_index.clear();
         self.match_index.clear();
-        for &peer in self
-            .current_config
-            .voters
-            .iter()
-            .filter(|&&peer| peer != self.id)
-        {
+        for peer in self.replication_targets() {
             self.next_index.insert(peer, next_index);
             self.match_index.insert(peer, 0);
         }
@@ -717,7 +781,21 @@ impl Node {
         self.broadcast_replication()
     }
 
+    /// Handles `Event::Tick`'s election-timeout path. A true no-op for this
+    /// tick -- no term bump, no `Candidate` transition -- unless `self.id`
+    /// is currently a voter (voters ∪ old_voters) under `current_config`.
+    /// This single invariant is what prevents three different disruption
+    /// scenarios: a learner self-electing before it's ever promoted, a
+    /// leader (or any server) just excluded from a committed `C_new`
+    /// re-electing itself, and a config-less joining node self-electing
+    /// (that last scenario needs a join-mode constructor this stage
+    /// doesn't add, but the invariant itself is general, not special-cased
+    /// to any one of the three).
     fn start_election(&mut self, next_timeout: u64) -> Vec<Effect> {
+        if !self.current_config.is_voter(self.id) {
+            return Vec::new();
+        }
+
         self.role = Role::Candidate;
         self.current_term += 1;
         self.voted_for = Some(self.id);
@@ -757,6 +835,53 @@ impl Node {
 
     fn on_request_vote(&mut self, from: NodeId, request: RequestVote) -> Vec<Effect> {
         if request.term < self.current_term {
+            return vec![Effect::Send {
+                to: from,
+                message: Message::RequestVoteResponse(RequestVoteResponse {
+                    term: self.current_term,
+                    granted: false,
+                }),
+            }];
+        }
+
+        // Removed-server disruption guard (paper §6 / dissertation §4.2.3):
+        // a node that IS the leader right now unconditionally disregards
+        // any incoming RequestVote -- including one with a higher term --
+        // without stepping down. `on_tick` returns early for
+        // `Role::Leader` (see `on_leader_tick`), so this node's own
+        // `election_elapsed` is frozen and isn't a meaningful "heard from
+        // a leader recently" signal the way it is for a Follower/
+        // Candidate; being the leader is itself the strongest possible
+        // instance of that signal. A genuinely stale or partitioned
+        // leader still learns of the new term normally once the partition
+        // heals, via AppendEntriesResponse/InstallSnapshotResponse term
+        // comparison -- not via RequestVote.
+        //
+        // The paper's matching Follower/Candidate-side guard (skip
+        // granting, don't step down, while this node's own election timer
+        // hasn't expired) is deliberately NOT implemented here. `on_tick`
+        // increments `election_elapsed` then checks it against
+        // `election_timeout`, and `start_election` resets it back to 0 the
+        // instant that threshold is reached -- so for any node for which
+        // `self.id` is a voter, `election_elapsed < election_timeout` is
+        // not a real-time-varying condition but an invariant that holds at
+        // all times while `role != Leader`: it becomes observably false
+        // only by the node itself becoming a fresh `Candidate` first, which
+        // immediately resets it to 0 again. A blanket Follower/Candidate
+        // guard keyed on that comparison would make the ordinary
+        // vote-granting path permanently unreachable for every voter,
+        // breaking essentially every multi-node election in the test
+        // suite -- confirmed empirically before this comment was written,
+        // not merely reasoned about. Closing this gap needs a real "heard
+        // from a leader" signal distinct from `election_elapsed` (e.g. a
+        // separate flag set only by `on_append_entries`/
+        // `on_install_snapshot`'s success paths), which is out of this
+        // stage's scope; the residual exposure is narrow, since a removed
+        // voter is only reachable here during the joint-consensus window
+        // in the first place -- `step()`'s `is_member` choke point already
+        // drops a `RequestVote` from a server fully excluded from
+        // `current_config` today.
+        if self.role == Role::Leader {
             return vec![Effect::Send {
                 to: from,
                 message: Message::RequestVoteResponse(RequestVoteResponse {
@@ -1153,15 +1278,14 @@ impl Node {
                     self.last_log_index()
                 } else {
                     // A voter `propose_config_change` just introduced may
-                    // never have been seeded into match_index --
-                    // become_leader only seeds from whatever voter set was
-                    // current at election time, and a brand-new voter
-                    // added mid-term by a config change was never a target
-                    // of that seeding. Same treatment as the old-set
-                    // branch below: an untracked peer counts as "not
-                    // caught up" (index 0), not assumed progress. Full
-                    // next_index/match_index seeding for a newly-added
-                    // voter is separate (learner) work.
+                    // still be unseeded in match_index -- become_leader
+                    // and add_learner both seed replication_targets()
+                    // (voters ∪ old_voters ∪ learners) at the point they
+                    // run, but a brand-new NodeId that was never a voter/
+                    // old-voter and never went through add_learner first
+                    // is still untracked here. Same treatment as the
+                    // old-set branch below: an untracked peer counts as
+                    // "not caught up" (index 0), not assumed progress.
                     self.match_index.get(&peer).copied().unwrap_or(0)
                 }
             })
@@ -1173,15 +1297,12 @@ impl Node {
         let candidate = match &self.current_config.old_voters {
             None => new_candidate,
             Some(old_voters) => {
-                // A peer being removed by this transition may never have
-                // been seeded into `match_index` -- `become_leader` seeds
-                // it from `current_config.voters` alone, and a
-                // removed-only peer (present in `old_voters`, absent from
-                // `voters`) was never a target of that seeding. Treat an
-                // untracked peer as "not caught up" (index 0) rather than
-                // assuming progress: full next_index/match_index seeding
-                // across voters ∪ old_voters ∪ learners lands once
-                // learners exist as a concept, not here.
+                // A peer present only in `old_voters` (already removed
+                // from `voters` by this transition) is normally still
+                // seeded -- become_leader/add_learner both cover
+                // old_voters -- but a peer removed before this leader's
+                // own election never was. Treat an untracked peer as "not
+                // caught up" (index 0) rather than assuming progress.
                 let mut old_match_indices: Vec<u64> = old_voters
                     .iter()
                     .copied()
@@ -1293,20 +1414,20 @@ impl Node {
     /// indexes `voters.len() - quorum_size()`, which underflows for a
     /// zero-length set.
     ///
-    /// A genuinely new `NodeId` in `new_voters` (one `become_leader` never
-    /// seeded into `next_index`/`match_index`, i.e. wasn't already a member
-    /// under the prior `current_config`) is safe for commit-index
-    /// arithmetic — an unseeded peer counts as "not caught up" rather than
-    /// panicking — but is not yet actually replicated to: `become_leader`
-    /// only seeds `next_index`/`match_index` for the voter set as of the
-    /// last election, so `broadcast_replication`'s next `on_leader_tick`
-    /// sweep will hit a missing `next_index` entry for it and panic in
-    /// `replicate_to`'s `.expect(...)`. (The two response handlers' own
-    /// trailing `replicate_to(from)` stay safe — `from` is always an
-    /// already-seeded peer that just responded.) Only a config change
-    /// among already-known peers (typically removing one) is currently
-    /// safe end-to-end; extending replication to a newly-introduced voter
-    /// is deferred, staged work.
+    /// A genuinely new `NodeId` in `new_voters` is always safe for
+    /// commit-index arithmetic, seeded or not — an unseeded peer counts as
+    /// "not caught up" (index 0) rather than panicking. Replication is a
+    /// separate concern: `become_leader` and `add_learner` both seed
+    /// `next_index`/`match_index` over `replication_targets()` (voters ∪
+    /// old_voters ∪ learners) at the point *they* run, but this call does
+    /// not re-seed anything itself. Introducing a `NodeId` this call has
+    /// never seen before — one that was never a voter/old-voter as of the
+    /// last election and was never added via `add_learner` — still panics
+    /// in `replicate_to`'s `.expect(...)` on the next `broadcast_replication`
+    /// sweep. `add_learner` first, then promoting via this call once
+    /// caught up, is the safe on-ramp for a genuinely new server; promoting
+    /// an already-known voter/old-voter (the common case: adding or
+    /// removing among peers already seeded) is safe either way.
     pub fn propose_config_change(&mut self, new_voters: Vec<NodeId>) -> Option<(u64, Vec<Effect>)> {
         if self.role != Role::Leader || new_voters.is_empty() {
             return None;
@@ -1330,6 +1451,68 @@ impl Node {
         effects.extend(self.advance_commit_index());
 
         Some((index, effects))
+    }
+
+    /// Leader-only: starts tracking `id` as a non-voting learner, so it
+    /// begins receiving ordinary replication (`become_leader`/
+    /// `broadcast_replication` both iterate `replication_targets()`,
+    /// which includes `learners`) without being counted toward any
+    /// quorum. This is the safe on-ramp for a genuinely new server: add it
+    /// as a learner, let it catch up via ordinary replication, then
+    /// promote it with `propose_config_change` once its `match_index` is
+    /// close to the leader's — `propose_config_change` itself never seeds
+    /// a brand-new `NodeId`, so promoting one that was never a learner
+    /// first still panics the next heartbeat sweep (see its own doc
+    /// comment).
+    ///
+    /// A no-op (empty effects, `self.learners` untouched) if this node
+    /// isn't the leader, if `id` is already tracked, or if `id` is
+    /// already a voter under `current_config` — a voter doesn't need
+    /// learner tracking, and letting the two states coexist would be a
+    /// confusing dual membership. Otherwise seeds `next_index`/
+    /// `match_index` for `id` exactly like `become_leader` would have had
+    /// `id` been a member at election time (`.entry(...).or_insert(...)`,
+    /// so an id that already has tracked progress from an earlier
+    /// tenure — e.g. a former voter — keeps it rather than resetting to
+    /// 0), then emits `Effect::PersistLearners` with the full updated set.
+    pub fn add_learner(&mut self, id: NodeId) -> Vec<Effect> {
+        if self.role != Role::Leader
+            || self.learners.contains(&id)
+            || self.current_config.is_voter(id)
+        {
+            return Vec::new();
+        }
+
+        self.learners.insert(id);
+        let next_index = self.last_log_index() + 1;
+        self.next_index.entry(id).or_insert(next_index);
+        self.match_index.entry(id).or_insert(0);
+
+        vec![Effect::PersistLearners {
+            learners: self.learners.iter().copied().collect(),
+        }]
+    }
+
+    /// Leader-only: stops tracking `id` as a learner (e.g. because
+    /// `propose_config_change` just promoted it to a voter, or it's being
+    /// removed from the cluster entirely). A no-op (empty effects,
+    /// `self.learners` untouched) if this node isn't the leader or `id`
+    /// isn't currently tracked. Deliberately leaves `next_index`/
+    /// `match_index` untouched: `id` may since have been promoted and
+    /// still be a voter this leader is actively replicating to, and
+    /// clearing its seeded progress here would panic the next
+    /// `broadcast_replication` sweep exactly like never seeding it at all
+    /// would.
+    pub fn remove_learner(&mut self, id: NodeId) -> Vec<Effect> {
+        if self.role != Role::Leader || !self.learners.contains(&id) {
+            return Vec::new();
+        }
+
+        self.learners.remove(&id);
+
+        vec![Effect::PersistLearners {
+            learners: self.learners.iter().copied().collect(),
+        }]
     }
 
     /// Compacts every log entry up to and including `up_to_index` into a
@@ -1497,6 +1680,7 @@ mod tests {
             hard_state,
             log.clone(),
             Snapshot::default(),
+            Vec::new(),
         )
         .expect("valid node");
 
@@ -1530,6 +1714,7 @@ mod tests {
                 metadata: snapshot,
                 data: vec![7, 7, 7],
             },
+            Vec::new(),
         )
         .expect("valid node");
 
@@ -1552,6 +1737,7 @@ mod tests {
             HardState::default(),
             Vec::new(),
             Snapshot::default(),
+            Vec::new(),
         );
 
         assert_eq!(
@@ -1772,8 +1958,19 @@ mod tests {
         );
     }
 
+    /// A leader disregards an incoming RequestVote -- even one with a
+    /// higher term -- unconditionally, without stepping down: the
+    /// removed-server disruption guard's Role::Leader special case
+    /// (`on_tick` returns early for a leader, so its own election_elapsed
+    /// is frozen and not a meaningful "heard from a leader recently"
+    /// signal -- being the leader is itself the strongest such signal).
+    /// Regardless of how many heartbeat ticks pass in between, since those
+    /// ticks never touch election_elapsed for a leader either. This
+    /// supersedes this codebase's pre-guard behavior, where a leader used
+    /// to step down and grant on any higher-term RequestVote like an
+    /// ordinary follower would.
     #[test]
-    fn steps_down_and_grants_vote_on_higher_term_request_vote() {
+    fn leader_disregards_a_higher_term_request_vote_without_stepping_down() {
         let peers = vec![NodeId(1), NodeId(2), NodeId(3)];
         let mut node = Node::new(NodeId(1), peers, 1, 1).expect("valid node");
         node.step(Event::Tick { next_timeout: 5 });
@@ -1786,6 +1983,11 @@ mod tests {
         });
         assert_eq!(node.role(), Role::Leader);
 
+        // A few heartbeat ticks pass -- on_leader_tick never advances
+        // election_elapsed, so this must not matter to the guard.
+        node.step(Event::Tick { next_timeout: 5 });
+        node.step(Event::Tick { next_timeout: 5 });
+
         let effects = node.step(Event::Step {
             from: NodeId(3),
             message: Message::RequestVote(RequestVote {
@@ -1796,24 +1998,22 @@ mod tests {
             }),
         });
 
-        assert_eq!(node.role(), Role::Follower);
-        assert_eq!(node.current_term(), 2);
-        assert_eq!(node.voted_for(), Some(NodeId(3)));
+        assert_eq!(
+            node.role(),
+            Role::Leader,
+            "a leader must not step down on an incoming RequestVote, however high its term"
+        );
+        assert_eq!(node.current_term(), 1);
+        assert_eq!(node.voted_for(), Some(NodeId(1)));
         assert_eq!(
             effects,
-            vec![
-                Effect::PersistHardState {
-                    term: 2,
-                    voted_for: Some(NodeId(3)),
-                },
-                Effect::Send {
-                    to: NodeId(3),
-                    message: Message::RequestVoteResponse(RequestVoteResponse {
-                        term: 2,
-                        granted: true,
-                    }),
-                }
-            ]
+            vec![Effect::Send {
+                to: NodeId(3),
+                message: Message::RequestVoteResponse(RequestVoteResponse {
+                    term: 1,
+                    granted: false,
+                }),
+            }]
         );
     }
 
@@ -3264,6 +3464,234 @@ mod tests {
     }
 
     #[test]
+    fn add_learner_is_a_no_op_when_not_leader() {
+        let peers = vec![NodeId(1), NodeId(2), NodeId(3)];
+        let mut node = Node::new(NodeId(1), peers, 5, 2).expect("valid node");
+
+        let effects = node.add_learner(NodeId(4));
+
+        assert!(effects.is_empty());
+        assert!(node.learners().is_empty());
+    }
+
+    #[test]
+    fn add_learner_is_a_no_op_for_an_existing_voter() {
+        let mut node = established_leader();
+
+        let effects = node.add_learner(NodeId(2));
+
+        assert!(
+            effects.is_empty(),
+            "a voter doesn't need learner tracking too -- the two states must not coexist"
+        );
+        assert!(node.learners().is_empty());
+    }
+
+    #[test]
+    fn remove_learner_is_a_no_op_when_not_tracked() {
+        let mut node = established_leader();
+
+        let effects = node.remove_learner(NodeId(4));
+
+        assert!(effects.is_empty());
+    }
+
+    #[test]
+    fn remove_learner_untracks_and_persists_the_updated_set() {
+        let mut node = established_leader();
+        node.add_learner(NodeId(4));
+
+        let effects = node.remove_learner(NodeId(4));
+
+        assert_eq!(
+            effects,
+            vec![Effect::PersistLearners {
+                learners: Vec::new()
+            }]
+        );
+        assert!(node.learners().is_empty());
+    }
+
+    #[test]
+    fn a_learner_is_replicated_to_but_never_counted_toward_quorum() {
+        let mut node = established_leader();
+
+        let effects = node.add_learner(NodeId(4));
+        assert_eq!(
+            effects,
+            vec![Effect::PersistLearners {
+                learners: vec![NodeId(4)],
+            }]
+        );
+        assert_eq!(node.learners(), &BTreeSet::from([NodeId(4)]));
+
+        // A heartbeat now reaches the learner too, not just voters --
+        // become_leader already ran before the learner existed, so this
+        // relies on add_learner's own next_index/match_index seeding.
+        let effects = node.step(Event::Tick { next_timeout: 5 });
+        assert!(
+            effects
+                .iter()
+                .any(|effect| matches!(effect, Effect::Send { to: NodeId(4), .. })),
+            "a tracked learner must receive ordinary replication"
+        );
+
+        // Even a fabricated, wildly-ahead match_index from the learner
+        // must not move commit_index -- it isn't a voter under
+        // current_config, so it's outside advance_commit_index's quorum
+        // arithmetic entirely, not merely outvoted.
+        node.step(Event::Step {
+            from: NodeId(4),
+            message: Message::AppendEntriesResponse(AppendEntriesResponse {
+                term: node.current_term(),
+                success: true,
+                match_index: 1000,
+            }),
+        });
+        assert_eq!(node.commit_index(), 0);
+        assert_eq!(
+            node.current_config(),
+            &ClusterConfig {
+                voters: vec![NodeId(1), NodeId(2), NodeId(3)],
+                old_voters: None,
+            },
+            "the learner's response must not have touched membership either"
+        );
+    }
+
+    /// The gap `propose_config_change`'s own doc comment (and 8ffe466's
+    /// commit message) documented as known and unreachable-in-practice: a
+    /// genuinely new voter added straight into `propose_config_change`
+    /// (never having gone through `add_learner` first) was never seeded
+    /// into `next_index`/`match_index`, so the next heartbeat sweep would
+    /// panic in `replicate_to`'s `.expect(...)`. Adding it as a learner
+    /// first -- the on-ramp this stage adds -- closes that gap: this test
+    /// deliberately does what the prior stage's own gate test
+    /// (`proposing_a_config_change_that_adds_a_never_seeded_voter_does_not_panic_or_commit_early`)
+    /// avoided on purpose, driving a real `Event::Tick` afterward.
+    #[test]
+    fn add_learner_then_promote_via_config_change_then_tick_replicates_without_panicking() {
+        let mut node = established_leader();
+
+        node.add_learner(NodeId(4));
+
+        node.propose_config_change(vec![NodeId(1), NodeId(2), NodeId(3), NodeId(4)])
+            .expect("leader accepts a config change promoting an existing learner");
+        assert_eq!(
+            node.current_config(),
+            &ClusterConfig {
+                voters: vec![NodeId(1), NodeId(2), NodeId(3), NodeId(4)],
+                old_voters: Some(vec![NodeId(1), NodeId(2), NodeId(3)]),
+            }
+        );
+
+        // No panic here is the actual assertion -- become_leader ran
+        // before NodeId(4) was ever a member of anything, so this only
+        // survives because add_learner seeded it up front.
+        let effects = node.step(Event::Tick { next_timeout: 5 });
+
+        assert!(
+            effects
+                .iter()
+                .any(|effect| matches!(effect, Effect::Send { to: NodeId(4), .. })),
+            "the newly promoted member must actually be replicated to, not just committed to config"
+        );
+    }
+
+    #[test]
+    fn a_node_excluded_from_current_config_never_calls_its_own_election() {
+        let peers = vec![NodeId(1), NodeId(2), NodeId(3)];
+        let mut node = Node::new(NodeId(1), peers, 3, 1).expect("valid node");
+
+        // A leader's AppendEntries carrying a config that excludes this
+        // node takes effect immediately, even before it commits -- the
+        // same live-on-append rule any Configuration entry gets. This is
+        // the closest reachable stand-in for a genuine not-yet-promoted
+        // learner: from its own perspective, a learner is exactly a node
+        // whose current_config doesn't list it as a voter.
+        node.step(Event::Step {
+            from: NodeId(2),
+            message: Message::AppendEntries(AppendEntries {
+                term: 1,
+                leader_id: NodeId(2),
+                prev_log_index: 0,
+                prev_log_term: 0,
+                entries: vec![LogEntry {
+                    term: 1,
+                    payload: LogPayload::Configuration(ClusterConfig {
+                        voters: vec![NodeId(2), NodeId(3)],
+                        old_voters: None,
+                    }),
+                }],
+                leader_commit: 0,
+            }),
+        });
+        assert!(!node.current_config().is_voter(NodeId(1)));
+
+        // Drive well past the election timeout, several times over.
+        for _ in 0..20 {
+            node.step(Event::Tick { next_timeout: 3 });
+        }
+
+        assert_eq!(
+            node.role(),
+            Role::Follower,
+            "an excluded node must never self-elect"
+        );
+        assert_eq!(
+            node.current_term(),
+            1,
+            "no election attempt was ever made, so the term never bumped past what the AppendEntries carried"
+        );
+    }
+
+    #[test]
+    fn a_leader_that_just_retired_never_re_campaigns() {
+        let mut node = established_leader();
+        node.propose_config_change(vec![NodeId(2), NodeId(3)])
+            .expect("leader accepts a config change that excludes itself");
+
+        // Drive the joint config, then the automatic C_new follow-up, all
+        // the way to commit -- both new-set members acking twice, mirroring
+        // a_leader_excluded_from_c_new_steps_down_only_once_c_new_commits_not_c_old_new.
+        for match_index in [1, 2] {
+            node.step(Event::Step {
+                from: NodeId(2),
+                message: Message::AppendEntriesResponse(AppendEntriesResponse {
+                    term: node.current_term(),
+                    success: true,
+                    match_index,
+                }),
+            });
+            node.step(Event::Step {
+                from: NodeId(3),
+                message: Message::AppendEntriesResponse(AppendEntriesResponse {
+                    term: node.current_term(),
+                    success: true,
+                    match_index,
+                }),
+            });
+        }
+        assert_eq!(node.role(), Role::Follower, "retired once C_new committed");
+        let term_after_retirement = node.current_term();
+
+        for _ in 0..20 {
+            node.step(Event::Tick { next_timeout: 3 });
+        }
+
+        assert_eq!(
+            node.role(),
+            Role::Follower,
+            "a retired leader must never re-campaign on its own"
+        );
+        assert_eq!(
+            node.current_term(),
+            term_after_retirement,
+            "no election attempt means no term bump"
+        );
+    }
+
+    #[test]
     fn compact_discards_the_committed_prefix_and_persists_the_snapshot() {
         let mut node = Node::new(NodeId(1), vec![NodeId(1)], 1, 1).expect("valid node");
         node.step(Event::Tick { next_timeout: 5 });
@@ -3627,6 +4055,7 @@ mod tests {
             HardState::default(),
             log,
             Snapshot::default(),
+            Vec::new(),
         )
         .expect("valid node");
         assert_eq!(node.current_config(), &joint_config);
@@ -3694,6 +4123,7 @@ mod tests {
             HardState::default(),
             log,
             Snapshot::default(),
+            Vec::new(),
         )
         .expect("valid node");
 

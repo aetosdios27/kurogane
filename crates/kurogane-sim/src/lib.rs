@@ -178,6 +178,11 @@ impl DurableState {
                 self.snapshot_data = data.clone();
             }
             Effect::Send { .. } => {}
+            // Real learner-set persistence in DurableState is separate,
+            // later cross-crate work, not this stage's job -- this arm
+            // exists only to keep the workspace compiling against the new
+            // Effect variant.
+            Effect::PersistLearners { .. } => {}
         }
     }
 }
@@ -419,6 +424,7 @@ mod tests {
             },
             Vec::new(),
             Snapshot::default(),
+            Vec::new(),
         )
         .expect("valid node");
         cluster.replace_node(recovered);
@@ -1406,6 +1412,7 @@ mod simulation_tests {
                 metadata: durable.snapshot(),
                 data: durable.snapshot_data().to_vec(),
             },
+            Vec::new(),
         )
         .expect("valid node");
         assert_eq!(recovered.role(), Role::Follower);
@@ -1470,6 +1477,7 @@ mod simulation_tests {
                 metadata: durable.snapshot(),
                 data: durable.snapshot_data().to_vec(),
             },
+            Vec::new(),
         )
         .expect("valid node");
 
@@ -1522,6 +1530,7 @@ mod simulation_tests {
                 metadata: durable.snapshot(),
                 data: durable.snapshot_data().to_vec(),
             },
+            Vec::new(),
         )
         .expect("valid node");
 

@@ -188,6 +188,11 @@ impl<T: PeerTransport> Actor<T> {
                 Effect::Send { to, message } => {
                     self.transport.send(*to, message.clone());
                 }
+                // Real learner-set persistence/wiring here is separate,
+                // later cross-crate work, not this stage's job -- this arm
+                // exists only to keep the workspace compiling against the
+                // new Effect variant.
+                Effect::PersistLearners { .. } => {}
             }
         }
         Ok(())
