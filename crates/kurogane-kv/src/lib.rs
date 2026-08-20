@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt;
 
-use kurogane_raft::{Effect, Event, Node};
+use kurogane_raft::{Effect, Event, LogPayload, Node};
 
 /// A client operation against the replicated key/value state machine.
 /// `Get` is a command, not a side-channel read: routing it through the log
@@ -180,6 +180,14 @@ impl StateMachine {
         }
     }
 
+    /// Advances `last_applied` by exactly one without touching the map --
+    /// for a committed log entry that carries no command for this state
+    /// machine to apply (a `Configuration` entry), so the applied-index
+    /// cursor still tracks `commit_index` correctly across it.
+    pub fn skip(&mut self) {
+        self.last_applied += 1;
+    }
+
     /// Serializes the entire map as `u32`-length-prefixed key/value byte
     /// strings, reusing `Command::encode`'s existing style rather than a
     /// fourth ad hoc format. `BTreeMap`'s iteration order is already
@@ -328,10 +336,15 @@ impl Replica {
                 .node
                 .entry_at(index)
                 .expect("a committed index not yet applied is still held in the log");
-            let command = Command::decode(&entry.command)
-                .expect("this replica only ever proposes commands it encoded itself");
-            let result = self.state_machine.apply(&command);
-            self.results.insert(index, result);
+            match &entry.payload {
+                LogPayload::Command(bytes) => {
+                    let command = Command::decode(bytes)
+                        .expect("this replica only ever proposes commands it encoded itself");
+                    let result = self.state_machine.apply(&command);
+                    self.results.insert(index, result);
+                }
+                LogPayload::Configuration(_) => self.state_machine.skip(),
+            }
         }
     }
 }
@@ -340,7 +353,9 @@ impl Replica {
 mod tests {
     use std::collections::BTreeMap;
 
-    use kurogane_raft::{AppendEntries, InstallSnapshot, LogEntry, Message, Node, NodeId, Role};
+    use kurogane_raft::{
+        AppendEntries, InstallSnapshot, LogEntry, LogPayload, Message, Node, NodeId, Role,
+    };
 
     use super::{ApplyResult, Command, DecodeError, Effect, Event, Replica, StateMachine};
 
@@ -665,11 +680,13 @@ mod tests {
                 prev_log_term: 0,
                 entries: vec![LogEntry {
                     term: 1,
-                    command: Command::Set {
-                        key: vec![9],
-                        value: vec![9],
-                    }
-                    .encode(),
+                    payload: LogPayload::Command(
+                        Command::Set {
+                            key: vec![9],
+                            value: vec![9],
+                        }
+                        .encode(),
+                    ),
                 }],
                 leader_commit: 1,
             }),

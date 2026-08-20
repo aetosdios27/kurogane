@@ -32,12 +32,49 @@ pub struct RequestVoteResponse {
     pub granted: bool,
 }
 
-/// One entry in a node's replicated log. `command` is opaque bytes;
-/// interpreting it as a client command is milestone four's job.
+/// A cluster's voting membership. `voters` is the active (or, during a
+/// joint-consensus transition, the *new*) set; `old_voters` is `Some` only
+/// while a transition is in flight, holding the set being replaced. Both
+/// sets must independently reach majority for anything — an election or a
+/// commit — to succeed while `old_voters` is `Some`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ClusterConfig {
+    pub voters: Vec<NodeId>,
+    pub old_voters: Option<Vec<NodeId>>,
+}
+
+impl ClusterConfig {
+    /// Whether `id` is a voter under either set this config carries.
+    pub fn is_voter(&self, id: NodeId) -> bool {
+        self.voters.contains(&id) || self.old_voters.as_deref().unwrap_or(&[]).contains(&id)
+    }
+
+    /// Whether this config is mid-transition (`C_old,new`, in the paper's
+    /// notation) rather than stable.
+    pub fn is_joint(&self) -> bool {
+        self.old_voters.is_some()
+    }
+}
+
+/// A log entry's payload. `Command` bytes are opaque to this crate — see
+/// `LogEntry`'s own doc comment — but `Configuration` is not: cluster
+/// membership is core protocol state, not an application concern, so this
+/// crate parses and acts on a `Configuration` entry immediately, even
+/// before it commits, exactly as it does for every other piece of Figure-2
+/// state.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum LogPayload {
+    Command(Vec<u8>),
+    Configuration(ClusterConfig),
+}
+
+/// One entry in a node's replicated log. A `Command` payload is opaque
+/// bytes; interpreting it as a client command is `kurogane-kv`'s job. A
+/// `Configuration` payload is not opaque — see `LogPayload`.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct LogEntry {
     pub term: u64,
-    pub command: Vec<u8>,
+    pub payload: LogPayload,
 }
 
 /// A leader's replication message. Empty `entries` is a heartbeat.
@@ -242,6 +279,11 @@ pub struct Node {
     /// Opaque bytes for `snapshot`, kept around so a leader can resend them
     /// via `InstallSnapshot` without asking its owner for them again.
     snapshot_data: Vec<u8>,
+    /// The configuration active as of `snapshot`'s boundary — inert
+    /// bookkeeping for now (nothing reads it yet; the constructor's
+    /// `peers` argument, wrapped as a stable config, is still the sole
+    /// source of truth for membership at this stage of the milestone).
+    snapshot_config: ClusterConfig,
 }
 
 impl Node {
@@ -302,6 +344,11 @@ impl Node {
             return Err(ConfigError::HeartbeatIntervalExceedsElectionTimeout);
         }
 
+        let snapshot_config = ClusterConfig {
+            voters: peers.clone(),
+            old_voters: None,
+        };
+
         Ok(Self {
             id,
             peers,
@@ -319,6 +366,7 @@ impl Node {
             match_index: BTreeMap::new(),
             snapshot: snapshot.metadata,
             snapshot_data: snapshot.data,
+            snapshot_config,
         })
     }
 
@@ -387,6 +435,14 @@ impl Node {
 
     pub fn snapshot_data(&self) -> &[u8] {
         &self.snapshot_data
+    }
+
+    /// The configuration active as of the current snapshot boundary. Inert
+    /// bookkeeping so far — `current_config()` (added once membership is
+    /// derived from the log rather than the constructor's fixed `peers`)
+    /// will be the one callers actually want.
+    pub fn snapshot_config(&self) -> &ClusterConfig {
+        &self.snapshot_config
     }
 
     /// Applies one explicit input to this node's protocol state, returning the
@@ -984,7 +1040,7 @@ impl Node {
 
         let entry = LogEntry {
             term: self.current_term,
-            command,
+            payload: LogPayload::Command(command),
         };
         self.log.push(entry.clone());
         let index = self.last_log_index();
@@ -1075,9 +1131,9 @@ mod tests {
     use std::collections::BTreeSet;
 
     use super::{
-        AppendEntries, AppendEntriesResponse, CompactError, ConfigError, Effect, Event, HardState,
-        InstallSnapshot, InstallSnapshotResponse, LogEntry, Message, Node, NodeId, RequestVote,
-        RequestVoteResponse, Role, Snapshot, SnapshotMetadata,
+        AppendEntries, AppendEntriesResponse, ClusterConfig, CompactError, ConfigError, Effect,
+        Event, HardState, InstallSnapshot, InstallSnapshotResponse, LogEntry, LogPayload, Message,
+        Node, NodeId, RequestVote, RequestVoteResponse, Role, Snapshot, SnapshotMetadata,
     };
 
     #[test]
@@ -1087,6 +1143,13 @@ mod tests {
 
         assert_eq!(node.id(), NodeId(2));
         assert_eq!(node.peers(), peers);
+        assert_eq!(
+            node.snapshot_config(),
+            &ClusterConfig {
+                voters: peers,
+                old_voters: None,
+            }
+        );
         assert_eq!(node.role(), Role::Follower);
         assert_eq!(node.current_term(), 0);
         assert_eq!(node.voted_for(), None);
@@ -1110,7 +1173,7 @@ mod tests {
         };
         let log = vec![LogEntry {
             term: 3,
-            command: vec![1],
+            payload: LogPayload::Command(vec![1]),
         }];
 
         let node = Node::recover(
@@ -1140,7 +1203,7 @@ mod tests {
         };
         let log = vec![LogEntry {
             term: 2,
-            command: vec![9],
+            payload: LogPayload::Command(vec![9]),
         }];
 
         let node = Node::recover(
@@ -1686,11 +1749,11 @@ mod tests {
         let entries = vec![
             LogEntry {
                 term: 1,
-                command: Vec::new(),
+                payload: LogPayload::Command(Vec::new()),
             },
             LogEntry {
                 term: 1,
-                command: Vec::new(),
+                payload: LogPayload::Command(Vec::new()),
             },
         ];
 
@@ -1746,11 +1809,11 @@ mod tests {
                 entries: vec![
                     LogEntry {
                         term: 1,
-                        command: vec![1],
+                        payload: LogPayload::Command(vec![1]),
                     },
                     LogEntry {
                         term: 1,
-                        command: vec![2],
+                        payload: LogPayload::Command(vec![2]),
                     },
                 ],
                 leader_commit: 0,
@@ -1760,7 +1823,7 @@ mod tests {
 
         let replacement = LogEntry {
             term: 2,
-            command: vec![9],
+            payload: LogPayload::Command(vec![9]),
         };
         let effects = node.step(Event::Step {
             from: NodeId(2),
@@ -1812,7 +1875,7 @@ mod tests {
                 prev_log_term: 0,
                 entries: vec![LogEntry {
                     term: 1,
-                    command: Vec::new(),
+                    payload: LogPayload::Command(Vec::new()),
                 }],
                 leader_commit: 0,
             }),
@@ -1845,7 +1908,7 @@ mod tests {
             prev_log_term: 0,
             entries: vec![LogEntry {
                 term: 1,
-                command: vec![7],
+                payload: LogPayload::Command(vec![7]),
             }],
             leader_commit: 0,
         };
@@ -2002,11 +2065,11 @@ mod tests {
                 entries: vec![
                     LogEntry {
                         term: 1,
-                        command: vec![1],
+                        payload: LogPayload::Command(vec![1]),
                     },
                     LogEntry {
                         term: 1,
-                        command: vec![2],
+                        payload: LogPayload::Command(vec![2]),
                     },
                 ],
                 leader_commit: 2,
@@ -2028,7 +2091,7 @@ mod tests {
                 prev_log_term: 1,
                 entries: vec![LogEntry {
                     term: 1,
-                    command: vec![3],
+                    payload: LogPayload::Command(vec![3]),
                 }],
                 leader_commit: 3,
             }),
@@ -2038,7 +2101,7 @@ mod tests {
             node.log(),
             &[LogEntry {
                 term: 1,
-                command: vec![3]
+                payload: LogPayload::Command(vec![3])
             }]
         );
         assert_eq!(node.last_log_index(), 3);
@@ -2049,7 +2112,7 @@ mod tests {
                     from_index: 3,
                     entries: vec![LogEntry {
                         term: 1,
-                        command: vec![3]
+                        payload: LogPayload::Command(vec![3])
                     }],
                 },
                 Effect::Send {
@@ -2071,15 +2134,15 @@ mod tests {
         let seed_entries = vec![
             LogEntry {
                 term: 1,
-                command: vec![1],
+                payload: LogPayload::Command(vec![1]),
             },
             LogEntry {
                 term: 1,
-                command: vec![2],
+                payload: LogPayload::Command(vec![2]),
             },
             LogEntry {
                 term: 1,
-                command: vec![3],
+                payload: LogPayload::Command(vec![3]),
             },
         ];
         node.step(Event::Step {
@@ -2098,7 +2161,7 @@ mod tests {
             node.log(),
             &[LogEntry {
                 term: 1,
-                command: vec![3]
+                payload: LogPayload::Command(vec![3])
             }]
         );
 
@@ -2125,7 +2188,7 @@ mod tests {
             node.log(),
             &[LogEntry {
                 term: 1,
-                command: vec![3]
+                payload: LogPayload::Command(vec![3])
             }]
         );
         assert_eq!(node.commit_index(), 3);
@@ -2214,7 +2277,7 @@ mod tests {
                 prev_log_term: 0,
                 entries: vec![LogEntry {
                     term: 1,
-                    command: vec![1],
+                    payload: LogPayload::Command(vec![1]),
                 }],
                 leader_commit: 0,
             }),
@@ -2328,11 +2391,11 @@ mod tests {
                 entries: vec![
                     LogEntry {
                         term: 1,
-                        command: vec![1],
+                        payload: LogPayload::Command(vec![1]),
                     },
                     LogEntry {
                         term: 1,
-                        command: vec![2],
+                        payload: LogPayload::Command(vec![2]),
                     },
                 ],
                 leader_commit: 2,
@@ -2378,7 +2441,7 @@ mod tests {
             .into_iter()
             .map(|term| LogEntry {
                 term,
-                command: Vec::new(),
+                payload: LogPayload::Command(Vec::new()),
             })
             .collect::<Vec<_>>();
         node.step(Event::Step {
@@ -2432,7 +2495,7 @@ mod tests {
             .into_iter()
             .map(|term| LogEntry {
                 term,
-                command: Vec::new(),
+                payload: LogPayload::Command(Vec::new()),
             })
             .collect::<Vec<_>>();
         node.step(Event::Step {
@@ -2647,7 +2710,7 @@ mod tests {
                 from_index: 1,
                 entries: vec![LogEntry {
                     term: 1,
-                    command: vec![9],
+                    payload: LogPayload::Command(vec![9]),
                 }],
             }]
         );
@@ -2655,7 +2718,7 @@ mod tests {
             node.log(),
             &[LogEntry {
                 term: 1,
-                command: vec![9],
+                payload: LogPayload::Command(vec![9]),
             }]
         );
     }
@@ -2695,7 +2758,7 @@ mod tests {
                     from_index: 3,
                     entries: vec![LogEntry {
                         term: 1,
-                        command: vec![3],
+                        payload: LogPayload::Command(vec![3]),
                     }],
                 },
             ]
@@ -2714,7 +2777,7 @@ mod tests {
             node.log(),
             &[LogEntry {
                 term: 1,
-                command: vec![3]
+                payload: LogPayload::Command(vec![3])
             }]
         );
         assert_eq!(node.last_log_index(), 3);
@@ -2723,7 +2786,7 @@ mod tests {
             node.entry_at(3),
             Some(&LogEntry {
                 term: 1,
-                command: vec![3]
+                payload: LogPayload::Command(vec![3])
             })
         );
     }
@@ -2816,7 +2879,7 @@ mod tests {
                     prev_log_term: 1,
                     entries: vec![LogEntry {
                         term: 1,
-                        command: vec![2],
+                        payload: LogPayload::Command(vec![2]),
                     }],
                     leader_commit: 1,
                 }),
@@ -2892,11 +2955,11 @@ mod tests {
                     entries: vec![
                         LogEntry {
                             term: 1,
-                            command: vec![1],
+                            payload: LogPayload::Command(vec![1]),
                         },
                         LogEntry {
                             term: 1,
-                            command: vec![2],
+                            payload: LogPayload::Command(vec![2]),
                         },
                     ],
                     leader_commit: 0,

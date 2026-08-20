@@ -14,6 +14,7 @@ use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 use kurogane_kv::{Command as KvCommand, StateMachine};
+use kurogane_raft::LogPayload;
 use kurogane_runtime::proto::raft_client_client::RaftClientClient;
 use kurogane_runtime::proto::{Command as ProtoCommand, ProposeRequest, SetCommand, propose_reply};
 use kurogane_runtime::storage::Storage;
@@ -352,9 +353,14 @@ async fn a_stopped_follower_recovers_via_install_snapshot_after_the_leader_compa
             // expose one) -- both fine for this single-sequential-writer
             // test, not a general guarantee.
             for entry in recovered.log() {
-                let command = KvCommand::decode(&entry.command)
-                    .expect("this test only ever proposes commands it encoded itself");
-                state.apply(&command);
+                match &entry.payload {
+                    LogPayload::Command(bytes) => {
+                        let command = KvCommand::decode(bytes)
+                            .expect("this test only ever proposes commands it encoded itself");
+                        state.apply(&command);
+                    }
+                    LogPayload::Configuration(_) => {}
+                }
             }
             if state.get(b"k19") == Some(&b"v19"[..]) {
                 break;

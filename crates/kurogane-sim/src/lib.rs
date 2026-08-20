@@ -347,7 +347,9 @@ impl Simulation {
 
 #[cfg(test)]
 mod tests {
-    use kurogane_raft::{Effect, HardState, LogEntry, Node, NodeId, Snapshot, SnapshotMetadata};
+    use kurogane_raft::{
+        Effect, HardState, LogEntry, LogPayload, Node, NodeId, Snapshot, SnapshotMetadata,
+    };
 
     use super::{Cluster, ClusterError, DurableState};
 
@@ -445,11 +447,11 @@ mod tests {
             entries: vec![
                 LogEntry {
                     term: 1,
-                    command: vec![1],
+                    payload: LogPayload::Command(vec![1]),
                 },
                 LogEntry {
                     term: 1,
-                    command: vec![2],
+                    payload: LogPayload::Command(vec![2]),
                 },
             ],
         });
@@ -467,7 +469,7 @@ mod tests {
         // on_append_entries does in-memory.
         let replacement = LogEntry {
             term: 2,
-            command: vec![9],
+            payload: LogPayload::Command(vec![9]),
         };
         durable.apply(&Effect::PersistHardState {
             term: 2,
@@ -497,15 +499,15 @@ mod tests {
             entries: vec![
                 LogEntry {
                     term: 1,
-                    command: vec![1],
+                    payload: LogPayload::Command(vec![1]),
                 },
                 LogEntry {
                     term: 1,
-                    command: vec![2],
+                    payload: LogPayload::Command(vec![2]),
                 },
                 LogEntry {
                     term: 1,
-                    command: vec![3],
+                    payload: LogPayload::Command(vec![3]),
                 },
             ],
         });
@@ -529,7 +531,7 @@ mod tests {
             from_index: 4,
             entries: vec![LogEntry {
                 term: 1,
-                command: vec![4],
+                payload: LogPayload::Command(vec![4]),
             }],
         });
 
@@ -545,7 +547,7 @@ mod tests {
             durable.log(),
             &[LogEntry {
                 term: 1,
-                command: vec![4]
+                payload: LogPayload::Command(vec![4])
             }]
         );
     }
@@ -575,8 +577,8 @@ mod simulation_tests {
 
     use kurogane_raft::{
         AppendEntries, AppendEntriesResponse, Effect, Event, InstallSnapshot,
-        InstallSnapshotResponse, LogEntry, Message, Node, NodeId, RequestVote, RequestVoteResponse,
-        Role, Snapshot, SnapshotMetadata,
+        InstallSnapshotResponse, LogEntry, LogPayload, Message, Node, NodeId, RequestVote,
+        RequestVoteResponse, Role, Snapshot, SnapshotMetadata,
     };
 
     use super::{Cluster, DurableState, Simulation};
@@ -1363,9 +1365,10 @@ mod simulation_tests {
             committed_log.as_slice()
         );
         assert!(
-            committed_log
-                .iter()
-                .all(|entry| entry.command != vec![b'C']),
+            committed_log.iter().all(|entry| !matches!(
+                &entry.payload,
+                LogPayload::Command(command) if command == &vec![b'C']
+            )),
             "an uncommitted entry from a deposed leader must not survive"
         );
     }
@@ -1447,7 +1450,7 @@ mod simulation_tests {
                 prev_log_term: 0,
                 entries: vec![LogEntry {
                     term: 1,
-                    command: vec![7],
+                    payload: LogPayload::Command(vec![7]),
                 }],
                 leader_commit: 0,
             }),
@@ -1476,7 +1479,7 @@ mod simulation_tests {
             recovered.log(),
             &[LogEntry {
                 term: 1,
-                command: vec![7],
+                payload: LogPayload::Command(vec![7]),
             }]
         );
     }
@@ -1528,7 +1531,7 @@ mod simulation_tests {
             recovered.log(),
             &[LogEntry {
                 term: 1,
-                command: vec![9],
+                payload: LogPayload::Command(vec![9]),
             }]
         );
     }

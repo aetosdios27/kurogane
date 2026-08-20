@@ -19,9 +19,22 @@ message RequestVoteReply {
   bool granted = 2;
 }
 
+// A cluster's voting membership. `voters` is the active (or, mid-transition,
+// the new) set; `old_voters` is the set being replaced during a
+// joint-consensus transition. proto3 has no `optional repeated`, so an
+// *empty* `old_voters` is the sentinel for "not joint" -- there is no
+// separate presence bit to check.
+message Configuration {
+  repeated uint64 voters = 1;
+  repeated uint64 old_voters = 2;
+}
+
 message LogEntry {
   uint64 term = 1;
-  bytes command = 2;
+  oneof payload {
+    bytes command = 2;
+    Configuration configuration = 3;
+  }
 }
 
 message AppendEntriesRequest {

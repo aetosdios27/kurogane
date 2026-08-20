@@ -31,12 +31,18 @@ impl Storage {
             Ok(bytes) => {
                 let record = proto::StorageState::decode(bytes.as_slice())
                     .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+                let log = record
+                    .log
+                    .into_iter()
+                    .map(log_entry_from_proto)
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
                 (
                     HardState {
                         current_term: record.current_term,
                         voted_for: record.voted_for.map(NodeId),
                     },
-                    record.log.into_iter().map(log_entry_from_proto).collect(),
+                    log,
                     SnapshotMetadata {
                         last_included_index: record.snapshot_last_included_index,
                         last_included_term: record.snapshot_last_included_term,
@@ -137,7 +143,7 @@ impl Storage {
 
 #[cfg(test)]
 mod tests {
-    use kurogane_raft::{HardState, LogEntry, NodeId};
+    use kurogane_raft::{HardState, LogEntry, LogPayload, NodeId};
     use tempfile::tempdir;
 
     use super::*;
@@ -186,11 +192,11 @@ mod tests {
                 entries: vec![
                     LogEntry {
                         term: 1,
-                        command: vec![1],
+                        payload: LogPayload::Command(vec![1]),
                     },
                     LogEntry {
                         term: 1,
-                        command: vec![2],
+                        payload: LogPayload::Command(vec![2]),
                     },
                 ],
             })
@@ -200,7 +206,7 @@ mod tests {
         // in-memory.
         let replacement = LogEntry {
             term: 2,
-            command: vec![9],
+            payload: LogPayload::Command(vec![9]),
         };
         storage
             .apply(&Effect::PersistLog {
@@ -226,15 +232,15 @@ mod tests {
                 entries: vec![
                     LogEntry {
                         term: 1,
-                        command: vec![1],
+                        payload: LogPayload::Command(vec![1]),
                     },
                     LogEntry {
                         term: 1,
-                        command: vec![2],
+                        payload: LogPayload::Command(vec![2]),
                     },
                     LogEntry {
                         term: 1,
-                        command: vec![3],
+                        payload: LogPayload::Command(vec![3]),
                     },
                 ],
             })
@@ -264,7 +270,7 @@ mod tests {
                 from_index: 4,
                 entries: vec![LogEntry {
                     term: 1,
-                    command: vec![4],
+                    payload: LogPayload::Command(vec![4]),
                 }],
             })
             .expect("persist log");
@@ -282,7 +288,7 @@ mod tests {
             reopened.log(),
             &[LogEntry {
                 term: 1,
-                command: vec![4]
+                payload: LogPayload::Command(vec![4])
             }]
         );
     }

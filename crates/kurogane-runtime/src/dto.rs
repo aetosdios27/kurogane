@@ -7,8 +7,8 @@ use std::fmt;
 
 use kurogane_kv::Command;
 use kurogane_raft::{
-    AppendEntries, AppendEntriesResponse, InstallSnapshot, InstallSnapshotResponse, LogEntry,
-    NodeId, RequestVote, RequestVoteResponse,
+    AppendEntries, AppendEntriesResponse, ClusterConfig, InstallSnapshot, InstallSnapshotResponse,
+    LogEntry, LogPayload, NodeId, RequestVote, RequestVoteResponse,
 };
 
 use crate::proto;
@@ -45,22 +45,59 @@ pub fn request_vote_response_to_proto(value: RequestVoteResponse) -> proto::Requ
     }
 }
 
-pub fn log_entry_from_proto(proto: proto::LogEntry) -> LogEntry {
-    LogEntry {
-        term: proto.term,
-        command: proto.command,
+pub fn configuration_from_proto(proto: proto::Configuration) -> ClusterConfig {
+    ClusterConfig {
+        voters: proto.voters.into_iter().map(NodeId).collect(),
+        old_voters: if proto.old_voters.is_empty() {
+            None
+        } else {
+            Some(proto.old_voters.into_iter().map(NodeId).collect())
+        },
     }
+}
+
+pub fn configuration_to_proto(value: ClusterConfig) -> proto::Configuration {
+    proto::Configuration {
+        voters: value.voters.into_iter().map(|id| id.0).collect(),
+        old_voters: value
+            .old_voters
+            .into_iter()
+            .flatten()
+            .map(|id| id.0)
+            .collect(),
+    }
+}
+
+pub fn log_entry_from_proto(proto: proto::LogEntry) -> Result<LogEntry, MissingLogEntryPayload> {
+    let payload = match proto.payload.ok_or(MissingLogEntryPayload)? {
+        proto::log_entry::Payload::Command(bytes) => LogPayload::Command(bytes),
+        proto::log_entry::Payload::Configuration(configuration) => {
+            LogPayload::Configuration(configuration_from_proto(configuration))
+        }
+    };
+    Ok(LogEntry {
+        term: proto.term,
+        payload,
+    })
 }
 
 pub fn log_entry_to_proto(value: LogEntry) -> proto::LogEntry {
+    let payload = match value.payload {
+        LogPayload::Command(bytes) => proto::log_entry::Payload::Command(bytes),
+        LogPayload::Configuration(configuration) => {
+            proto::log_entry::Payload::Configuration(configuration_to_proto(configuration))
+        }
+    };
     proto::LogEntry {
         term: value.term,
-        command: value.command,
+        payload: Some(payload),
     }
 }
 
-pub fn append_entries_from_proto(proto: proto::AppendEntriesRequest) -> AppendEntries {
-    AppendEntries {
+pub fn append_entries_from_proto(
+    proto: proto::AppendEntriesRequest,
+) -> Result<AppendEntries, MissingLogEntryPayload> {
+    Ok(AppendEntries {
         term: proto.term,
         leader_id: NodeId(proto.leader_id),
         prev_log_index: proto.prev_log_index,
@@ -69,9 +106,9 @@ pub fn append_entries_from_proto(proto: proto::AppendEntriesRequest) -> AppendEn
             .entries
             .into_iter()
             .map(log_entry_from_proto)
-            .collect(),
+            .collect::<Result<Vec<_>, _>>()?,
         leader_commit: proto.leader_commit,
-    }
+    })
 }
 
 pub fn append_entries_to_proto(value: AppendEntries) -> proto::AppendEntriesRequest {
@@ -154,6 +191,19 @@ impl fmt::Display for MissingCommandKind {
 
 impl Error for MissingCommandKind {}
 
+/// A `LogEntry` message with no `payload` set — malformed input, since
+/// every legitimate caller sets either `command` or `configuration`.
+#[derive(Debug)]
+pub struct MissingLogEntryPayload;
+
+impl fmt::Display for MissingLogEntryPayload {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("LogEntry message is missing its payload")
+    }
+}
+
+impl Error for MissingLogEntryPayload {}
+
 pub fn command_from_proto(proto: proto::Command) -> Result<Command, MissingCommandKind> {
     match proto.kind.ok_or(MissingCommandKind)? {
         proto::command::Kind::Set(set) => Ok(Command::Set {
@@ -218,18 +268,19 @@ mod tests {
             entries: vec![
                 LogEntry {
                     term: 4,
-                    command: vec![1, 2, 3],
+                    payload: LogPayload::Command(vec![1, 2, 3]),
                 },
                 LogEntry {
                     term: 4,
-                    command: Vec::new(),
+                    payload: LogPayload::Command(Vec::new()),
                 },
             ],
             leader_commit: 1,
         };
 
         assert_eq!(
-            append_entries_from_proto(append_entries_to_proto(value.clone())),
+            append_entries_from_proto(append_entries_to_proto(value.clone()))
+                .expect("every entry has a payload"),
             value
         );
     }
@@ -315,5 +366,57 @@ mod tests {
         let proto = proto::Command { kind: None };
 
         assert!(command_from_proto(proto).is_err());
+    }
+
+    #[test]
+    fn round_trips_a_stable_configuration() {
+        let value = ClusterConfig {
+            voters: vec![NodeId(1), NodeId(2), NodeId(3)],
+            old_voters: None,
+        };
+
+        assert_eq!(
+            configuration_from_proto(configuration_to_proto(value.clone())),
+            value
+        );
+    }
+
+    #[test]
+    fn round_trips_a_joint_configuration() {
+        let value = ClusterConfig {
+            voters: vec![NodeId(1), NodeId(2), NodeId(4)],
+            old_voters: Some(vec![NodeId(1), NodeId(2), NodeId(3)]),
+        };
+
+        assert_eq!(
+            configuration_from_proto(configuration_to_proto(value.clone())),
+            value
+        );
+    }
+
+    #[test]
+    fn round_trips_a_configuration_log_entry() {
+        let value = LogEntry {
+            term: 6,
+            payload: LogPayload::Configuration(ClusterConfig {
+                voters: vec![NodeId(1), NodeId(2)],
+                old_voters: Some(vec![NodeId(1), NodeId(2), NodeId(3)]),
+            }),
+        };
+
+        assert_eq!(
+            log_entry_from_proto(log_entry_to_proto(value.clone())).expect("payload is set"),
+            value
+        );
+    }
+
+    #[test]
+    fn rejects_a_log_entry_with_no_payload_set() {
+        let proto = proto::LogEntry {
+            term: 1,
+            payload: None,
+        };
+
+        assert!(log_entry_from_proto(proto).is_err());
     }
 }

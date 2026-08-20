@@ -54,7 +54,8 @@ impl RaftPeer for RaftPeerService {
         &self,
         request: Request<AppendEntriesRequest>,
     ) -> Result<Response<AppendEntriesReply>, Status> {
-        let value = dto::append_entries_from_proto(request.into_inner());
+        let value = dto::append_entries_from_proto(request.into_inner())
+            .map_err(|error| Status::invalid_argument(error.to_string()))?;
         let from = value.leader_id;
 
         let reply = self
