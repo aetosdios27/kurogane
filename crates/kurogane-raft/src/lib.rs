@@ -456,9 +456,21 @@ impl Node {
             return Err(ConfigError::HeartbeatIntervalExceedsElectionTimeout);
         }
 
-        let snapshot_config = ClusterConfig {
-            voters: peers,
-            old_voters: None,
+        // A non-default snapshot means a real prior snapshot exists, and its
+        // own `config` field holds the actual durable membership as of that
+        // boundary -- preferring `peers` here would silently discard
+        // mid-transition membership on every ordinary restart, undoing the
+        // entire "membership lives in replicated state" property this
+        // milestone exists to establish. Only a genuinely fresh node (no
+        // snapshot at all, `last_included_index == 0`) falls back to
+        // wrapping `peers` as the bootstrap (C_0) configuration.
+        let snapshot_config = if snapshot.metadata.last_included_index > 0 {
+            snapshot.config.clone()
+        } else {
+            ClusterConfig {
+                voters: peers,
+                old_voters: None,
+            }
         };
         let (current_config, current_config_index) =
             latest_configuration_in(&log, snapshot.metadata.last_included_index).unwrap_or_else(
@@ -1804,7 +1816,7 @@ mod tests {
 
         let node = Node::recover(
             NodeId(1),
-            peers,
+            peers.clone(),
             1,
             1,
             HardState::default(),
@@ -1812,7 +1824,17 @@ mod tests {
             Snapshot {
                 metadata: snapshot,
                 data: vec![7, 7, 7],
-                config: ClusterConfig::default(),
+                // A real (non-default) snapshot with a plausible config, not
+                // ClusterConfig::default() -- a genuinely empty voter set
+                // here would still pass this test's own assertions (none of
+                // which touch current_config), but leaves a voterless node
+                // that panics the moment anything calls advance_commit_index
+                // on it, which is a confusing trap for a fixture to set for
+                // future readers.
+                config: ClusterConfig {
+                    voters: peers,
+                    old_voters: None,
+                },
             },
             Vec::new(),
         )
@@ -1825,6 +1847,44 @@ mod tests {
         assert_eq!(node.snapshot(), snapshot);
         assert_eq!(node.snapshot_data(), &[7, 7, 7]);
         assert_eq!(node.last_log_index(), 5);
+    }
+
+    #[test]
+    fn recover_prefers_the_snapshots_own_config_over_the_peers_argument() {
+        // The peers argument names a stale/irrelevant set on purpose -- a
+        // real snapshot's own `config` field is the durable membership that
+        // must win, since it may reflect a mid-transition config the peers
+        // argument (e.g. an operator's KUROGANE_PEERS) has no way to know
+        // about. If recover regresses to wrapping `peers` again, this test
+        // fails because current_config() would come back as [1, 2, 3, 9]
+        // instead of the snapshot's [1, 2, 3, 4].
+        let peers = vec![NodeId(1), NodeId(2), NodeId(3), NodeId(9)];
+        let snapshot_voters = vec![NodeId(1), NodeId(2), NodeId(3), NodeId(4)];
+
+        let node = Node::recover(
+            NodeId(1),
+            peers,
+            1,
+            1,
+            HardState::default(),
+            Vec::new(),
+            Snapshot {
+                metadata: SnapshotMetadata {
+                    last_included_index: 4,
+                    last_included_term: 2,
+                },
+                data: vec![1, 2, 3],
+                config: ClusterConfig {
+                    voters: snapshot_voters.clone(),
+                    old_voters: None,
+                },
+            },
+            Vec::new(),
+        )
+        .expect("valid node");
+
+        assert_eq!(node.current_config().voters, snapshot_voters);
+        assert_eq!(node.snapshot_config().voters, snapshot_voters);
     }
 
     #[test]

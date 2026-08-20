@@ -5,7 +5,8 @@ use std::error::Error;
 use std::fmt;
 
 use kurogane_raft::{
-    Effect, Event, HardState, LogEntry, Message, Node, NodeId, Role, SnapshotMetadata,
+    ClusterConfig, Effect, Event, HardState, LogEntry, Message, Node, NodeId, Role,
+    SnapshotMetadata,
 };
 
 /// Invalid construction of a deterministic cluster.
@@ -126,6 +127,14 @@ pub struct DurableState {
     log: Vec<LogEntry>,
     snapshot: SnapshotMetadata,
     snapshot_data: Vec<u8>,
+    /// The membership active as of `snapshot`'s boundary, captured from
+    /// `Effect::PersistSnapshot`'s own `config` field -- mirrors
+    /// `Node::snapshot_config`, the field it's replayed into on recovery.
+    snapshot_config: ClusterConfig,
+    /// The learner set, captured from `Effect::PersistLearners` -- durably
+    /// persisted independently of hard state/log/snapshot timing, same as
+    /// `Node::recover`'s own `learners` parameter.
+    learners: Vec<NodeId>,
 }
 
 impl DurableState {
@@ -143,6 +152,14 @@ impl DurableState {
 
     pub fn snapshot_data(&self) -> &[u8] {
         &self.snapshot_data
+    }
+
+    pub fn snapshot_config(&self) -> &ClusterConfig {
+        &self.snapshot_config
+    }
+
+    pub fn learners(&self) -> &[NodeId] {
+        &self.learners
     }
 
     /// Records one effect as durably written. `Send` is not persistence and
@@ -170,25 +187,19 @@ impl DurableState {
                 last_included_index,
                 last_included_term,
                 data,
-                // Real snapshot-config persistence in DurableState is
-                // separate, later cross-crate work, not this stage's job --
-                // ignored here only to keep the workspace compiling against
-                // the widened Effect variant, same treatment as
-                // PersistLearners below.
-                config: _,
+                config,
             } => {
                 self.snapshot = SnapshotMetadata {
                     last_included_index: *last_included_index,
                     last_included_term: *last_included_term,
                 };
                 self.snapshot_data = data.clone();
+                self.snapshot_config = config.clone();
             }
             Effect::Send { .. } => {}
-            // Real learner-set persistence in DurableState is separate,
-            // later cross-crate work, not this stage's job -- this arm
-            // exists only to keep the workspace compiling against the new
-            // Effect variant.
-            Effect::PersistLearners { .. } => {}
+            Effect::PersistLearners { learners } => {
+                self.learners = learners.clone();
+            }
         }
     }
 }
@@ -567,6 +578,62 @@ mod tests {
                 payload: LogPayload::Command(vec![4])
             }]
         );
+        assert_eq!(
+            durable.snapshot_config(),
+            &ClusterConfig {
+                voters: vec![NodeId(1)],
+                old_voters: None,
+            }
+        );
+    }
+
+    #[test]
+    fn durable_state_persists_learners_and_a_recovered_node_prefers_the_snapshots_own_config() {
+        let mut durable = DurableState::default();
+
+        // A learner is tracked independently of any snapshot/log timing.
+        durable.apply(&Effect::PersistLearners {
+            learners: vec![NodeId(4)],
+        });
+        assert_eq!(durable.learners(), &[NodeId(4)]);
+
+        // A later compaction captures the config active as of its boundary
+        // -- here, a joint config mid-transition, to prove the full byte
+        // (well, field) actually survives the round trip through
+        // DurableState and back into a recovered Node, not just DurableState
+        // itself. This is what makes gap 1's Node::recover fix meaningful:
+        // without it, the recovered node below would end up with
+        // current_config().voters == stale_peers instead.
+        let real_config = ClusterConfig {
+            voters: vec![NodeId(1), NodeId(2), NodeId(4)],
+            old_voters: Some(vec![NodeId(1), NodeId(2)]),
+        };
+        durable.apply(&Effect::PersistSnapshot {
+            last_included_index: 5,
+            last_included_term: 1,
+            data: vec![1, 2, 3],
+            config: real_config.clone(),
+        });
+        assert_eq!(durable.snapshot_config(), &real_config);
+
+        let stale_peers = vec![NodeId(1), NodeId(2)];
+        let recovered = Node::recover(
+            NodeId(1),
+            stale_peers,
+            1,
+            1,
+            durable.hard_state(),
+            durable.log().to_vec(),
+            Snapshot {
+                metadata: durable.snapshot(),
+                data: durable.snapshot_data().to_vec(),
+                config: durable.snapshot_config().clone(),
+            },
+            durable.learners().to_vec(),
+        )
+        .expect("valid node");
+
+        assert_eq!(recovered.current_config(), &real_config);
     }
 
     #[test]
