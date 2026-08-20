@@ -292,15 +292,37 @@ pub struct Node {
     /// append, `on_append_entries`'s merge/truncate, and `compact`'s
     /// drain), never read lazily.
     current_config: ClusterConfig,
+    /// The absolute log index of the entry that established `current_config`
+    /// -- `snapshot.last_included_index` if `current_config` came from
+    /// `snapshot_config` rather than a live log entry. Kept in lockstep with
+    /// `current_config` by `recompute_config` (and `recover`'s equivalent
+    /// initialization); `advance_commit_index` compares `commit_index`
+    /// against this to know when the currently active configuration entry
+    /// itself has committed, which is what triggers the automatic
+    /// `C_old,new` -> `C_new` follow-up and the not-in-`C_new` leader
+    /// step-down.
+    current_config_index: u64,
 }
 
-/// The most recent `Configuration` payload in `log`, scanning backward, or
-/// `None` if every entry (if any) is a `Command`.
-fn latest_configuration_in(log: &[LogEntry]) -> Option<ClusterConfig> {
-    log.iter().rev().find_map(|entry| match &entry.payload {
-        LogPayload::Configuration(config) => Some(config.clone()),
-        LogPayload::Command(_) => None,
-    })
+/// The most recent `Configuration` payload in `log`, scanning backward,
+/// paired with its absolute log index -- `snapshot_last_included_index` is
+/// the boundary `log[0]` sits just above, so `log[i]`'s absolute index is
+/// `snapshot_last_included_index + i + 1`. `None` if every entry (if any) is
+/// a `Command`.
+fn latest_configuration_in(
+    log: &[LogEntry],
+    snapshot_last_included_index: u64,
+) -> Option<(ClusterConfig, u64)> {
+    log.iter()
+        .enumerate()
+        .rev()
+        .find_map(|(offset, entry)| match &entry.payload {
+            LogPayload::Configuration(config) => Some((
+                config.clone(),
+                snapshot_last_included_index + offset as u64 + 1,
+            )),
+            LogPayload::Command(_) => None,
+        })
 }
 
 /// Whether `reached` holds for a strict majority of `set`, independent of
@@ -374,8 +396,15 @@ impl Node {
             voters: peers,
             old_voters: None,
         };
-        let current_config =
-            latest_configuration_in(&log).unwrap_or_else(|| snapshot_config.clone());
+        let (current_config, current_config_index) =
+            latest_configuration_in(&log, snapshot.metadata.last_included_index).unwrap_or_else(
+                || {
+                    (
+                        snapshot_config.clone(),
+                        snapshot.metadata.last_included_index,
+                    )
+                },
+            );
 
         Ok(Self {
             id,
@@ -395,6 +424,7 @@ impl Node {
             snapshot_data: snapshot.data,
             snapshot_config,
             current_config,
+            current_config_index,
         })
     }
 
@@ -422,8 +452,17 @@ impl Node {
     /// entry in `log`, or `snapshot_config` if none remains. Called after
     /// every mutation that can change what "latest" means.
     fn recompute_config(&mut self) {
-        self.current_config =
-            latest_configuration_in(&self.log).unwrap_or_else(|| self.snapshot_config.clone());
+        let (current_config, current_config_index) =
+            latest_configuration_in(&self.log, self.snapshot.last_included_index).unwrap_or_else(
+                || {
+                    (
+                        self.snapshot_config.clone(),
+                        self.snapshot.last_included_index,
+                    )
+                },
+            );
+        self.current_config = current_config;
+        self.current_config_index = current_config_index;
     }
 
     pub fn role(&self) -> Role {
@@ -1000,17 +1039,23 @@ impl Node {
         let match_index = match_index.max(response.last_included_index);
         self.match_index.insert(from, match_index);
         self.next_index.insert(from, match_index + 1);
-        self.advance_commit_index();
+        let mut effects = self.advance_commit_index();
 
-        let next_index = *self
-            .next_index
-            .get(&from)
-            .expect("next_index tracked for every peer while leader");
-        if next_index <= self.last_log_index() {
-            vec![self.replicate_to(from)]
-        } else {
-            Vec::new()
+        // advance_commit_index may have just retired this node from
+        // leadership (config-triggered step-down) -- a node that just
+        // demoted itself to Follower must not still emit leader
+        // replication traffic in this same batch, and next_index/
+        // match_index are no longer tracked to look `from` up in anyway.
+        if self.role == Role::Leader {
+            let next_index = *self
+                .next_index
+                .get(&from)
+                .expect("next_index tracked for every peer while leader");
+            if next_index <= self.last_log_index() {
+                effects.push(self.replicate_to(from));
+            }
         }
+        effects
     }
 
     fn on_append_entries_response(
@@ -1030,6 +1075,7 @@ impl Node {
             return Vec::new();
         }
 
+        let mut effects = Vec::new();
         if response.success {
             let match_index = *self
                 .match_index
@@ -1038,7 +1084,7 @@ impl Node {
             let match_index = match_index.max(response.match_index);
             self.match_index.insert(from, match_index);
             self.next_index.insert(from, match_index + 1);
-            self.advance_commit_index();
+            effects = self.advance_commit_index();
         } else {
             let next_index = *self
                 .next_index
@@ -1048,15 +1094,21 @@ impl Node {
                 .insert(from, next_index.saturating_sub(1).max(1));
         }
 
-        let next_index = *self
-            .next_index
-            .get(&from)
-            .expect("next_index tracked for every peer while leader");
-        if next_index <= self.last_log_index() {
-            vec![self.replicate_to(from)]
-        } else {
-            Vec::new()
+        // advance_commit_index may have just retired this node from
+        // leadership (config-triggered step-down) -- a node that just
+        // demoted itself to Follower must not still emit leader
+        // replication traffic in this same batch, and next_index/
+        // match_index are no longer tracked to look `from` up in anyway.
+        if self.role == Role::Leader {
+            let next_index = *self
+                .next_index
+                .get(&from)
+                .expect("next_index tracked for every peer while leader");
+            if next_index <= self.last_log_index() {
+                effects.push(self.replicate_to(from));
+            }
         }
+        effects
     }
 
     /// The majority-commit rule restricted to the current term (Raft's
@@ -1070,7 +1122,27 @@ impl Node {
     /// the two sets' own thresholds, not the maximum: taking the maximum
     /// would let an entry commit on one side's majority alone, exactly the
     /// split-brain scenario joint consensus exists to prevent.
-    fn advance_commit_index(&mut self) {
+    ///
+    /// Leader-only side effects, checked in order once `commit_index` has
+    /// been updated above, each re-reading `current_config`/
+    /// `current_config_index` fresh at the point it runs rather than a
+    /// value cached before this call: a single call can never satisfy both
+    /// in one pass, because the first check's own append (if it fires)
+    /// changes `current_config` before the second check would even look at
+    /// it, and the second check's condition (a *plain* config's commit)
+    /// can't become true in the same call that just produced a *plain*
+    /// config from a joint one — that new entry starts uncommitted.
+    ///
+    /// - If `commit_index` just reached or passed the index of a still-
+    ///   joint `current_config`, this leader appends the automatic
+    ///   `C_old,new` -> `C_new` follow-up entry (same voters, no
+    ///   `old_voters`) to its own log — the first place in this codebase a
+    ///   function produces a new log entry as a side effect of commit
+    ///   advancement rather than an explicit caller request.
+    /// - If `commit_index` just reached or passed the index of a still-
+    ///   plain `current_config` that excludes `self.id`, this leader
+    ///   retires via `retire_from_leadership`.
+    fn advance_commit_index(&mut self) -> Vec<Effect> {
         let mut new_match_indices: Vec<u64> = self
             .current_config
             .voters
@@ -1080,10 +1152,17 @@ impl Node {
                 if peer == self.id {
                     self.last_log_index()
                 } else {
-                    *self
-                        .match_index
-                        .get(&peer)
-                        .expect("match_index tracked for every peer while leader")
+                    // A voter `propose_config_change` just introduced may
+                    // never have been seeded into match_index --
+                    // become_leader only seeds from whatever voter set was
+                    // current at election time, and a brand-new voter
+                    // added mid-term by a config change was never a target
+                    // of that seeding. Same treatment as the old-set
+                    // branch below: an untracked peer counts as "not
+                    // caught up" (index 0), not assumed progress. Full
+                    // next_index/match_index seeding for a newly-added
+                    // voter is separate (learner) work.
+                    self.match_index.get(&peer).copied().unwrap_or(0)
                 }
             })
             .collect();
@@ -1124,6 +1203,49 @@ impl Node {
         if candidate > self.commit_index && self.term_at(candidate) == Some(self.current_term) {
             self.commit_index = candidate;
         }
+
+        let mut effects = Vec::new();
+
+        if self.current_config.old_voters.is_some()
+            && self.commit_index >= self.current_config_index
+        {
+            let follow_up = LogEntry {
+                term: self.current_term,
+                payload: LogPayload::Configuration(ClusterConfig {
+                    voters: self.current_config.voters.clone(),
+                    old_voters: None,
+                }),
+            };
+            self.log.push(follow_up.clone());
+            self.recompute_config();
+            let index = self.last_log_index();
+            effects.push(Effect::PersistLog {
+                from_index: index,
+                entries: vec![follow_up],
+            });
+            // Mirrors propose()'s own shape: a fresh append needs its own
+            // commit-advancement pass too (the single-node-cluster
+            // immediate-commit case lands here), which may itself chain
+            // into the step-down check below.
+            effects.extend(self.advance_commit_index());
+        }
+
+        // If the branch above just recursed, that inner call may already
+        // have retired this node (its own copy of this same check, run on
+        // the post-append state before returning up the stack) -- this
+        // re-check then simply repeats the same true/false verdict against
+        // now-identical state. Deliberately still a plain `if`, not
+        // `else if`: the two checks must each read live state at the point
+        // they run, and collapsing them would silently stop re-checking
+        // after a non-recursing joint commit that didn't itself qualify.
+        if self.current_config.old_voters.is_none()
+            && self.commit_index >= self.current_config_index
+            && !self.current_config.voters.contains(&self.id)
+        {
+            self.retire_from_leadership();
+        }
+
+        effects
     }
 
     /// Appends `command` to this node's log if it is the leader, returning
@@ -1142,15 +1264,72 @@ impl Node {
         self.log.push(entry.clone());
         self.recompute_config();
         let index = self.last_log_index();
-        self.advance_commit_index();
 
-        Some((
-            index,
-            vec![Effect::PersistLog {
-                from_index: index,
-                entries: vec![entry],
-            }],
-        ))
+        let mut effects = vec![Effect::PersistLog {
+            from_index: index,
+            entries: vec![entry],
+        }];
+        effects.extend(self.advance_commit_index());
+
+        Some((index, effects))
+    }
+
+    /// Leader-only: begins a joint-consensus configuration change to
+    /// `new_voters`. Mirrors `propose`'s exact shape — appends a
+    /// `Configuration` entry (here, the `C_old,new` joint config: `voters:
+    /// new_voters`, `old_voters: Some(current_config.voters.clone())`),
+    /// takes effect immediately (even before it commits, Raft's membership
+    /// rule), and returns the new entry's index plus the effects needed to
+    /// make it durable. `None` if not leader, exactly like `propose`.
+    ///
+    /// Everything past this one entry — the automatic `C_new` follow-up
+    /// once the joint entry commits, and this leader's own step-down if
+    /// `C_new` excludes it once *that* commits — is driven entirely by
+    /// `advance_commit_index`, not by any second call here.
+    ///
+    /// Rejects an empty `new_voters` with `None`: unlike `propose`'s opaque
+    /// `command` bytes, an empty voter set is a real invariant violation
+    /// here — `quorum_size`/`advance_commit_index`'s majority arithmetic
+    /// indexes `voters.len() - quorum_size()`, which underflows for a
+    /// zero-length set.
+    ///
+    /// A genuinely new `NodeId` in `new_voters` (one `become_leader` never
+    /// seeded into `next_index`/`match_index`, i.e. wasn't already a member
+    /// under the prior `current_config`) is safe for commit-index
+    /// arithmetic — an unseeded peer counts as "not caught up" rather than
+    /// panicking — but is not yet actually replicated to: `become_leader`
+    /// only seeds `next_index`/`match_index` for the voter set as of the
+    /// last election, so `broadcast_replication`'s next `on_leader_tick`
+    /// sweep will hit a missing `next_index` entry for it and panic in
+    /// `replicate_to`'s `.expect(...)`. (The two response handlers' own
+    /// trailing `replicate_to(from)` stay safe — `from` is always an
+    /// already-seeded peer that just responded.) Only a config change
+    /// among already-known peers (typically removing one) is currently
+    /// safe end-to-end; extending replication to a newly-introduced voter
+    /// is deferred, staged work.
+    pub fn propose_config_change(&mut self, new_voters: Vec<NodeId>) -> Option<(u64, Vec<Effect>)> {
+        if self.role != Role::Leader || new_voters.is_empty() {
+            return None;
+        }
+
+        let entry = LogEntry {
+            term: self.current_term,
+            payload: LogPayload::Configuration(ClusterConfig {
+                voters: new_voters,
+                old_voters: Some(self.current_config.voters.clone()),
+            }),
+        };
+        self.log.push(entry.clone());
+        self.recompute_config();
+        let index = self.last_log_index();
+
+        let mut effects = vec![Effect::PersistLog {
+            from_index: index,
+            entries: vec![entry],
+        }];
+        effects.extend(self.advance_commit_index());
+
+        Some((index, effects))
     }
 
     /// Compacts every log entry up to and including `up_to_index` into a
@@ -1216,6 +1395,19 @@ impl Node {
         self.role = Role::Follower;
         self.current_term = term;
         self.voted_for = None;
+        self.votes_granted.clear();
+        self.next_index.clear();
+        self.match_index.clear();
+    }
+
+    /// Demotes a leader that has just discovered its own exclusion from a
+    /// newly-committed plain (non-joint) configuration. Distinct from
+    /// `step_down`: this isn't triggered by discovering a higher term, so
+    /// `current_term`/`voted_for` are left untouched — only role and the
+    /// same leader-only bookkeeping `step_down` clears (`votes_granted`/
+    /// `next_index`/`match_index`, all safely re-derivable) reset.
+    fn retire_from_leadership(&mut self) {
+        self.role = Role::Follower;
         self.votes_granted.clear();
         self.next_index.clear();
         self.match_index.clear();
@@ -2854,6 +3046,221 @@ mod tests {
 
         assert_eq!(index, 1);
         assert_eq!(node.commit_index(), 1);
+    }
+
+    #[test]
+    fn propose_config_change_on_a_single_node_cluster_completes_the_full_joint_to_plain_lifecycle()
+    {
+        let mut node = Node::new(NodeId(1), vec![NodeId(1)], 1, 1).expect("valid node");
+        node.step(Event::Tick { next_timeout: 5 });
+        assert_eq!(node.role(), Role::Leader);
+        assert_eq!(
+            node.current_config(),
+            &ClusterConfig {
+                voters: vec![NodeId(1)],
+                old_voters: None,
+            }
+        );
+
+        let (index, effects) = node
+            .propose_config_change(vec![NodeId(1)])
+            .expect("leader accepts a config change");
+
+        // A single-node cluster reaches both halves of the dual-majority
+        // rule trivially, so the same call that proposes the joint entry
+        // also drives the automatic C_new follow-up all the way to commit
+        // -- the full lifecycle end-to-end, not split across two calls.
+        assert_eq!(
+            index, 1,
+            "the joint entry is index 1 -- there is no bootstrap log entry"
+        );
+        assert_eq!(
+            effects,
+            vec![
+                Effect::PersistLog {
+                    from_index: 1,
+                    entries: vec![LogEntry {
+                        term: 1,
+                        payload: LogPayload::Configuration(ClusterConfig {
+                            voters: vec![NodeId(1)],
+                            old_voters: Some(vec![NodeId(1)]),
+                        }),
+                    }],
+                },
+                Effect::PersistLog {
+                    from_index: 2,
+                    entries: vec![LogEntry {
+                        term: 1,
+                        payload: LogPayload::Configuration(ClusterConfig {
+                            voters: vec![NodeId(1)],
+                            old_voters: None,
+                        }),
+                    }],
+                },
+            ]
+        );
+        assert_eq!(node.commit_index(), 2);
+        assert_eq!(
+            node.current_config(),
+            &ClusterConfig {
+                voters: vec![NodeId(1)],
+                old_voters: None,
+            },
+            "the automatic C_new follow-up committed too, clearing old_voters again"
+        );
+        assert_eq!(
+            node.role(),
+            Role::Leader,
+            "self is still a voter under C_new, so no step-down fires"
+        );
+    }
+
+    #[test]
+    fn a_leader_excluded_from_c_new_steps_down_only_once_c_new_commits_not_c_old_new() {
+        let mut node = established_leader();
+        assert_eq!(node.current_term(), 1);
+        assert_eq!(node.voted_for(), Some(NodeId(1)));
+
+        node.propose_config_change(vec![NodeId(2), NodeId(3)])
+            .expect("leader accepts a config change that excludes itself");
+        assert_eq!(
+            node.current_config(),
+            &ClusterConfig {
+                voters: vec![NodeId(2), NodeId(3)],
+                old_voters: Some(vec![NodeId(1), NodeId(2), NodeId(3)]),
+            },
+            "the joint config takes effect immediately, even before it commits"
+        );
+
+        // The new set {2, 3} needs both members to ack before its own
+        // majority is reached -- node 2 alone is not enough yet.
+        node.step(Event::Step {
+            from: NodeId(2),
+            message: Message::AppendEntriesResponse(AppendEntriesResponse {
+                term: 1,
+                success: true,
+                match_index: 1,
+            }),
+        });
+        assert_eq!(
+            node.commit_index(),
+            0,
+            "the new set alone (only node 2 of the new voters) has not reached its own majority"
+        );
+        assert_eq!(node.role(), Role::Leader);
+
+        // Node 3 acking the joint entry now completes both sets' own
+        // majorities: it commits, and the automatic C_new follow-up
+        // (voters: {2, 3}, old_voters: None) is appended in this same
+        // call -- live immediately, even though it hasn't committed yet.
+        node.step(Event::Step {
+            from: NodeId(3),
+            message: Message::AppendEntriesResponse(AppendEntriesResponse {
+                term: 1,
+                success: true,
+                match_index: 1,
+            }),
+        });
+        assert_eq!(node.commit_index(), 1, "the joint entry has now committed");
+        assert_eq!(
+            node.current_config(),
+            &ClusterConfig {
+                voters: vec![NodeId(2), NodeId(3)],
+                old_voters: None,
+            },
+            "C_new takes effect immediately, before it has itself committed"
+        );
+        assert_eq!(
+            node.role(),
+            Role::Leader,
+            "excluding self from C_new only matters once C_new itself commits"
+        );
+
+        // Node 2 acking the follow-up (index 2) alone is not enough -- the
+        // new set {2, 3} still needs both.
+        node.step(Event::Step {
+            from: NodeId(2),
+            message: Message::AppendEntriesResponse(AppendEntriesResponse {
+                term: 1,
+                success: true,
+                match_index: 2,
+            }),
+        });
+        assert_eq!(node.commit_index(), 1);
+        assert_eq!(node.role(), Role::Leader);
+
+        // Node 3 acking the follow-up too finally commits C_new -- only
+        // now does the leader actually step down.
+        let effects = node.step(Event::Step {
+            from: NodeId(3),
+            message: Message::AppendEntriesResponse(AppendEntriesResponse {
+                term: 1,
+                success: true,
+                match_index: 2,
+            }),
+        });
+
+        assert_eq!(node.commit_index(), 2);
+        assert_eq!(
+            node.role(),
+            Role::Follower,
+            "C_new commits and excludes self -- step down"
+        );
+        assert_eq!(
+            node.current_term(),
+            1,
+            "this step-down is config-triggered, not term-driven -- the term is unchanged"
+        );
+        assert_eq!(
+            node.voted_for(),
+            Some(NodeId(1)),
+            "retire_from_leadership must not touch voted_for, unlike step_down"
+        );
+        // The trailing replicate_to(from) both response handlers otherwise
+        // emit unconditionally must be suppressed once a step-down fires
+        // inside advance_commit_index in this same batch: a node that just
+        // demoted itself must not still emit leader replication traffic.
+        assert!(
+            effects.is_empty(),
+            "no leader-replication Send may appear in the batch that produced the step-down"
+        );
+    }
+
+    #[test]
+    fn proposing_a_config_change_that_adds_a_never_seeded_voter_does_not_panic_or_commit_early() {
+        let mut node = established_leader();
+
+        // NodeId(4) was never a member -- become_leader never seeded it
+        // into next_index/match_index. advance_commit_index's majority
+        // arithmetic must treat it as "not caught up" (index 0) rather
+        // than panicking on a missing match_index entry. Deliberately no
+        // Event::Tick anywhere in this test: a heartbeat's
+        // broadcast_replication sweep -- not advance_commit_index -- is
+        // the actually-unsafe path for a never-seeded voter (see
+        // propose_config_change's doc comment); asserting past that would
+        // require the become_leader/broadcast_replication seeding fix that
+        // is explicitly deferred, staged work, not this stage's job.
+        let (index, _effects) = node
+            .propose_config_change(vec![NodeId(1), NodeId(2), NodeId(3), NodeId(4)])
+            .expect("leader accepts a config change that adds a new voter");
+
+        assert_eq!(
+            node.current_config(),
+            &ClusterConfig {
+                voters: vec![NodeId(1), NodeId(2), NodeId(3), NodeId(4)],
+                old_voters: Some(vec![NodeId(1), NodeId(2), NodeId(3)]),
+            }
+        );
+        // Neither the new set (self alone, of a 4-voter quorum of 3) nor
+        // the old set (self alone, of a 3-voter quorum of 2) has reached
+        // its own majority yet -- the joint entry must not have committed.
+        assert_eq!(node.commit_index(), 0);
+        assert_eq!(
+            node.role(),
+            Role::Leader,
+            "no panic, no premature step-down"
+        );
+        assert_eq!(index, 1);
     }
 
     #[test]
