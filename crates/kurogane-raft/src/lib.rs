@@ -512,6 +512,69 @@ impl Node {
         })
     }
 
+    /// Constructs a brand-new node joining an existing cluster for the
+    /// first time: no durable state of its own yet, and — unlike
+    /// `new`/`recover` — deliberately **not** a voter under any
+    /// configuration, not even a degenerate one-member `[id]` config. A
+    /// join-mode node with a self-inclusive bootstrap config would believe
+    /// itself a one-voter cluster and start deposing the real leader the
+    /// instant its election timeout first fires; going through `recover`
+    /// at all is wrong here; not just inconvenient, since `recover`
+    /// unconditionally requires `peers` to be non-empty and self-inclusive
+    /// (`EmptyConfiguration`/`LocalNodeMissing`) even when the snapshot
+    /// path would otherwise discard it. This node is safe to sit idle
+    /// indefinitely: `start_election`'s campaign-eligibility invariant
+    /// (never campaign unless `self.id` is a voter under `current_config`)
+    /// already refuses to let an empty-config node run for election, so it
+    /// waits passively until a real leader's `AppendEntries`/
+    /// `InstallSnapshot` admits it — first as a learner (an existing
+    /// leader's `add_learner`, replicating without granting voting
+    /// rights), later as a full voter once a `propose_config_change` that
+    /// includes this node's id actually commits.
+    pub fn new_learner(
+        id: NodeId,
+        election_timeout: u64,
+        heartbeat_interval: u64,
+    ) -> Result<Self, ConfigError> {
+        if election_timeout == 0 {
+            return Err(ConfigError::ZeroElectionTimeout);
+        }
+        if heartbeat_interval == 0 {
+            return Err(ConfigError::ZeroHeartbeatInterval);
+        }
+        if heartbeat_interval > election_timeout {
+            return Err(ConfigError::HeartbeatIntervalExceedsElectionTimeout);
+        }
+
+        let empty_config = ClusterConfig {
+            voters: Vec::new(),
+            old_voters: None,
+        };
+
+        Ok(Self {
+            id,
+            role: Role::Follower,
+            current_term: 0,
+            voted_for: None,
+            election_elapsed: 0,
+            election_timeout,
+            votes_granted: BTreeSet::new(),
+            heartbeat_elapsed: 0,
+            heartbeat_interval,
+            leader_contact_elapsed: heartbeat_interval,
+            log: Vec::new(),
+            commit_index: 0,
+            next_index: BTreeMap::new(),
+            match_index: BTreeMap::new(),
+            snapshot: SnapshotMetadata::default(),
+            snapshot_data: Vec::new(),
+            snapshot_config: empty_config.clone(),
+            current_config: empty_config,
+            current_config_index: 0,
+            learners: BTreeSet::new(),
+        })
+    }
+
     pub fn id(&self) -> NodeId {
         self.id
     }
@@ -1522,10 +1585,29 @@ impl Node {
     /// sweep. `add_learner` first, then promoting via this call once
     /// caught up, is the safe on-ramp for a genuinely new server; promoting
     /// an already-known voter/old-voter (the common case: adding or
-    /// removing among peers already seeded) is safe either way.
+    /// removing among peers already seeded) is safe either way. Any
+    /// learner named in `new_voters` is dropped from `learners` here, so
+    /// the two sets never overlap after a promotion.
     pub fn propose_config_change(&mut self, new_voters: Vec<NodeId>) -> Option<(u64, Vec<Effect>)> {
         if self.role != Role::Leader || new_voters.is_empty() {
             return None;
+        }
+
+        // Any learner named in the new voter set is being promoted, not
+        // merely still tracked -- drop it from `learners` so the two sets
+        // don't overlap post-promotion (voter status now comes entirely
+        // from `current_config`, the same way it already does for every
+        // other voter). Persisted like any other change to `learners`,
+        // ahead of the dependent Sends `advance_commit_index` may add
+        // below, same before-any-dependent-Send ordering every other
+        // effect in this crate follows.
+        let learner_count_before = self.learners.len();
+        self.learners.retain(|id| !new_voters.contains(id));
+        let mut effects = Vec::new();
+        if self.learners.len() != learner_count_before {
+            effects.push(Effect::PersistLearners {
+                learners: self.learners.iter().copied().collect(),
+            });
         }
 
         let entry = LogEntry {
@@ -1539,10 +1621,10 @@ impl Node {
         self.recompute_config();
         let index = self.last_log_index();
 
-        let mut effects = vec![Effect::PersistLog {
+        effects.push(Effect::PersistLog {
             from_index: index,
             entries: vec![entry],
-        }];
+        });
         effects.extend(self.advance_commit_index());
 
         Some((index, effects))
@@ -1769,6 +1851,58 @@ mod tests {
         assert_eq!(node.commit_index(), 0);
         assert!(node.log().is_empty());
         assert!(node.votes_granted().is_empty());
+    }
+
+    #[test]
+    fn new_learner_constructs_a_node_that_is_a_voter_under_no_configuration() {
+        let node = Node::new_learner(NodeId(4), 5, 1).expect("valid join-mode node");
+
+        assert_eq!(node.id(), NodeId(4));
+        assert_eq!(node.role(), Role::Follower);
+        assert_eq!(node.current_term(), 0);
+        assert_eq!(node.voted_for(), None);
+        assert_eq!(
+            node.current_config(),
+            &ClusterConfig {
+                voters: Vec::new(),
+                old_voters: None,
+            }
+        );
+        assert!(node.voters().is_empty());
+        assert!(node.log().is_empty());
+        assert_eq!(node.commit_index(), 0);
+    }
+
+    #[test]
+    fn new_learner_never_self_elects_even_after_many_ticks() {
+        let mut node = Node::new_learner(NodeId(4), 3, 1).expect("valid join-mode node");
+
+        for _ in 0..10 {
+            let effects = node.step(Event::Tick { next_timeout: 3 });
+            assert!(
+                effects.is_empty(),
+                "a node that is a voter under no configuration must never campaign"
+            );
+        }
+
+        assert_eq!(node.role(), Role::Follower);
+        assert_eq!(node.current_term(), 0);
+    }
+
+    #[test]
+    fn new_learner_rejects_the_same_degenerate_timeouts_as_new() {
+        assert_eq!(
+            Node::new_learner(NodeId(1), 0, 1).unwrap_err(),
+            ConfigError::ZeroElectionTimeout
+        );
+        assert_eq!(
+            Node::new_learner(NodeId(1), 1, 0).unwrap_err(),
+            ConfigError::ZeroHeartbeatInterval
+        );
+        assert_eq!(
+            Node::new_learner(NodeId(1), 1, 2).unwrap_err(),
+            ConfigError::HeartbeatIntervalExceedsElectionTimeout
+        );
     }
 
     #[test]
@@ -3817,6 +3951,36 @@ mod tests {
             node.role(),
             Role::Leader,
             "self is still a voter under C_new, so no step-down fires"
+        );
+    }
+
+    #[test]
+    fn promoting_a_learner_via_config_change_removes_it_from_learners_and_persists_the_change() {
+        let mut node = Node::new(NodeId(1), vec![NodeId(1)], 1, 1).expect("valid node");
+        node.step(Event::Tick { next_timeout: 5 });
+        assert_eq!(node.role(), Role::Leader);
+
+        let add_effects = node.add_learner(NodeId(2));
+        assert!(
+            add_effects
+                .iter()
+                .any(|effect| matches!(effect, Effect::PersistLearners { learners } if learners == &[NodeId(2)]))
+        );
+        assert_eq!(node.learners(), &BTreeSet::from([NodeId(2)]));
+
+        let (_, effects) = node
+            .propose_config_change(vec![NodeId(1), NodeId(2)])
+            .expect("leader accepts a config change promoting its learner");
+
+        assert!(
+            node.learners().is_empty(),
+            "a promoted learner must not still be tracked as one"
+        );
+        assert!(
+            effects
+                .iter()
+                .any(|effect| matches!(effect, Effect::PersistLearners { learners } if learners.is_empty())),
+            "the now-empty learner set must be persisted, not just changed in memory"
         );
     }
 
