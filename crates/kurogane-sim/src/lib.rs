@@ -48,7 +48,9 @@ pub struct Cluster {
 }
 
 impl Cluster {
-    /// Takes ownership of one node for every member in a shared configuration.
+    /// Takes ownership of one node per member. Members are not required to
+    /// share an identical config view -- see `ClusterError`'s doc comment
+    /// for why that's no longer enforced here.
     pub fn new(nodes: Vec<Node>) -> Result<Self, ClusterError> {
         if nodes.is_empty() {
             return Err(ClusterError::EmptyCluster);
@@ -285,6 +287,45 @@ impl Simulation {
                 (node.role() == Role::Leader).then(|| (id, node.current_term()))
             })
             .collect()
+    }
+
+    /// Reads one node's current state without mutating anything -- e.g. to
+    /// discover the current leader's own `current_config`/`voters()` before
+    /// deciding what config-change operation to drive next.
+    pub fn node(&self, id: NodeId) -> Option<&Node> {
+        self.cluster.node(id)
+    }
+
+    /// Drives `leader`'s `Node::add_learner(id)` and routes whatever
+    /// effects it produces (just `Effect::PersistLearners`, no `Send`, per
+    /// its own doc comment) through the same scheduler every other
+    /// mutation goes through, so a config-change schedule driven through
+    /// this method still replays identically under
+    /// `same_seed_and_schedule_reproduces_an_identical_trace`-style replay.
+    /// A no-op if `leader` isn't a known node.
+    pub fn add_learner(&mut self, leader: NodeId, id: NodeId) {
+        let Some(node) = self.cluster.node_mut(leader) else {
+            return;
+        };
+        let effects = node.add_learner(id);
+        self.apply_effects(leader, effects);
+    }
+
+    /// Drives `leader`'s `Node::propose_config_change(new_voters)` and
+    /// routes whatever effects it produces through the scheduler, mirroring
+    /// `add_learner` above. Returns the new entry's index, or `None` if
+    /// `leader` isn't a known node or isn't actually the leader (or
+    /// `new_voters` is empty) -- exactly `propose_config_change`'s own
+    /// `None` cases.
+    pub fn propose_config_change(
+        &mut self,
+        leader: NodeId,
+        new_voters: Vec<NodeId>,
+    ) -> Option<u64> {
+        let node = self.cluster.node_mut(leader)?;
+        let (index, effects) = node.propose_config_change(new_voters)?;
+        self.apply_effects(leader, effects);
+        Some(index)
     }
 
     /// Advances logical time by one tick: delivers due messages, then ticks every
@@ -745,6 +786,47 @@ mod simulation_tests {
                 .step(Event::Step { from, message });
             pending.extend(sends(to, response, isolated));
         }
+    }
+
+    /// The `Message` (if any) that `effects` sends to `to`. For hand-driven
+    /// scenarios that need to selectively deliver only some of a batch of
+    /// `Send`s (e.g. withholding one peer's copy of a heartbeat to control
+    /// exactly which acks land first), where `deliver_until_quiescent`'s
+    /// full recursive delivery would give away too much control.
+    fn message_to(effects: &[Effect], to: NodeId) -> Option<Message> {
+        let mut found = None;
+        for effect in effects {
+            if let Effect::Send {
+                to: target,
+                message,
+            } = effect
+            {
+                if *target == to {
+                    assert!(found.is_none(), "expected at most one message to {to:?}");
+                    found = Some(message.clone());
+                }
+            }
+        }
+        found
+    }
+
+    /// Asserts no more than one node in `cluster` currently believes itself
+    /// `Role::Leader` -- the `Cluster`-level counterpart to
+    /// `run_until_leader_checking_invariants`'s per-tick check, for
+    /// hand-driven scenarios that drive a `Cluster` directly instead of
+    /// through `Simulation`.
+    fn assert_at_most_one_leader(cluster: &Cluster) {
+        let leaders: Vec<(NodeId, u64)> = cluster
+            .node_ids()
+            .filter_map(|id| {
+                let node = cluster.node(id).expect("known node");
+                (node.role() == Role::Leader).then(|| (id, node.current_term()))
+            })
+            .collect();
+        assert!(
+            leaders.len() <= 1,
+            "no more than one leader may exist at once, saw {leaders:?}"
+        );
     }
 
     #[test]
@@ -1618,6 +1700,785 @@ mod simulation_tests {
                 term: 1,
                 payload: LogPayload::Command(vec![9]),
             }]
+        );
+    }
+    #[test]
+    fn add_a_voter_to_a_three_node_cluster_requires_old_and_new_majority_through_real_delivery() {
+        // Mirrors kurogane-raft's own
+        // a_joint_commit_requires_match_progress_on_both_the_old_and_new_voters
+        // test, but through kurogane-sim's Cluster/real message delivery
+        // instead of direct Node calls. For a pure single-voter add from 3
+        // to 4, "new-set-majority-alone" is mathematically unconstructible
+        // as an insufficient case (every 3-of-4 combination necessarily
+        // includes at least 2 of the original 3) -- see the smaller,
+        // literal mirror below for that direction. What *is* constructible
+        // here, and is the realistic danger the dual-majority rule guards
+        // against, is the reverse: old-set majority reached without the
+        // new voter having caught up at all.
+        let mut cluster = Cluster::new(vec![
+            Node::new(NodeId(1), vec![NodeId(1), NodeId(2), NodeId(3)], 1, 1).expect("valid node"),
+            Node::new(NodeId(2), vec![NodeId(1), NodeId(2), NodeId(3)], 1, 1).expect("valid node"),
+            Node::new(NodeId(3), vec![NodeId(1), NodeId(2), NodeId(3)], 1, 1).expect("valid node"),
+            // Node::new_learner doesn't exist yet, so node 4 stands in for
+            // a real joiner: seeded with the eventual full voter set up
+            // front and a deliberately huge election timeout, so it can
+            // never self-elect before being genuinely admitted -- it's
+            // never ticked in this test at all.
+            Node::new(
+                NodeId(4),
+                vec![NodeId(1), NodeId(2), NodeId(3), NodeId(4)],
+                1_000_000,
+                1,
+            )
+            .expect("valid node"),
+        ])
+        .expect("valid cluster");
+
+        let requests = cluster
+            .node_mut(NodeId(1))
+            .expect("known node")
+            .step(Event::Tick { next_timeout: 10 });
+        deliver_until_quiescent(&mut cluster, &[], NodeId(1), requests);
+        assert_eq!(
+            cluster.node(NodeId(1)).expect("known node").role(),
+            Role::Leader
+        );
+
+        cluster
+            .node_mut(NodeId(1))
+            .expect("known node")
+            .add_learner(NodeId(4));
+        let (index, _effects) = cluster
+            .node_mut(NodeId(1))
+            .expect("known node")
+            .propose_config_change(vec![NodeId(1), NodeId(2), NodeId(3), NodeId(4)])
+            .expect("leader accepts config change");
+
+        let heartbeat = cluster
+            .node_mut(NodeId(1))
+            .expect("known node")
+            .step(Event::Tick { next_timeout: 10 });
+
+        // Deliver only to node 2, deliberately withholding node 3 and node
+        // 4.
+        let node2_message = message_to(&heartbeat, NodeId(2)).expect("leader replicates to node 2");
+        let node2_response = cluster
+            .node_mut(NodeId(2))
+            .expect("known node")
+            .step(Event::Step {
+                from: NodeId(1),
+                message: node2_message,
+            });
+        cluster
+            .node_mut(NodeId(1))
+            .expect("known node")
+            .step(Event::Step {
+                from: NodeId(2),
+                message: message_to(&node2_response, NodeId(1)).expect("node 2 acks"),
+            });
+        assert_eq!(
+            cluster.node(NodeId(1)).expect("known node").commit_index(),
+            0,
+            "old-set majority alone (self + node 2, of 3), before the new voter has caught \
+             up at all, must not commit"
+        );
+
+        // Node 4 -- the new voter -- catches up too, completing the new
+        // set's own majority (self + 2 + 4, of 4) now that old-set
+        // majority was already satisfied.
+        let node4_message = message_to(&heartbeat, NodeId(4)).expect("leader replicates to node 4");
+        let node4_response = cluster
+            .node_mut(NodeId(4))
+            .expect("known node")
+            .step(Event::Step {
+                from: NodeId(1),
+                message: node4_message,
+            });
+        cluster
+            .node_mut(NodeId(1))
+            .expect("known node")
+            .step(Event::Step {
+                from: NodeId(4),
+                message: message_to(&node4_response, NodeId(1)).expect("node 4 acks"),
+            });
+        assert_eq!(
+            cluster.node(NodeId(1)).expect("known node").commit_index(),
+            index
+        );
+    }
+
+    #[test]
+    fn add_a_voter_new_set_majority_alone_does_not_commit_without_the_old_set_too() {
+        // The literal, discriminating mirror of kurogane-raft's own
+        // a_joint_commit_requires_match_progress_on_both_the_old_and_new_voters
+        // test (old {1, 4}, new {1, 4, 5} there): a 2-voter cluster adding
+        // a 3rd is the smallest shape where new-set majority actually can
+        // be reached without old-set majority also being satisfied -- a
+        // 3-to-4 add (the test above) can't produce that combination at
+        // all.
+        let mut cluster = Cluster::new(vec![
+            Node::new(NodeId(1), vec![NodeId(1), NodeId(2)], 1, 1).expect("valid node"),
+            Node::new(NodeId(2), vec![NodeId(1), NodeId(2)], 1, 1).expect("valid node"),
+            Node::new(
+                NodeId(3),
+                vec![NodeId(1), NodeId(2), NodeId(3)],
+                1_000_000,
+                1,
+            )
+            .expect("valid node"),
+        ])
+        .expect("valid cluster");
+
+        let requests = cluster
+            .node_mut(NodeId(1))
+            .expect("known node")
+            .step(Event::Tick { next_timeout: 10 });
+        deliver_until_quiescent(&mut cluster, &[], NodeId(1), requests);
+        assert_eq!(
+            cluster.node(NodeId(1)).expect("known node").role(),
+            Role::Leader
+        );
+
+        cluster
+            .node_mut(NodeId(1))
+            .expect("known node")
+            .add_learner(NodeId(3));
+        let (index, _effects) = cluster
+            .node_mut(NodeId(1))
+            .expect("known node")
+            .propose_config_change(vec![NodeId(1), NodeId(2), NodeId(3)])
+            .expect("leader accepts config change");
+
+        let heartbeat = cluster
+            .node_mut(NodeId(1))
+            .expect("known node")
+            .step(Event::Tick { next_timeout: 10 });
+
+        // Only node 3 -- the new voter -- catches up. self + 3 satisfies
+        // the new set's majority (2 of 3), but the old set {1, 2} still
+        // has only self's own progress (1 of 2), below its own quorum.
+        let node3_message = message_to(&heartbeat, NodeId(3)).expect("leader replicates to node 3");
+        let node3_response = cluster
+            .node_mut(NodeId(3))
+            .expect("known node")
+            .step(Event::Step {
+                from: NodeId(1),
+                message: node3_message,
+            });
+        cluster
+            .node_mut(NodeId(1))
+            .expect("known node")
+            .step(Event::Step {
+                from: NodeId(3),
+                message: message_to(&node3_response, NodeId(1)).expect("node 3 acks"),
+            });
+        assert_eq!(
+            cluster.node(NodeId(1)).expect("known node").commit_index(),
+            0,
+            "new-set majority alone, without old-set majority, must not commit"
+        );
+
+        // Node 2 -- the sole other old-set member -- now also acks,
+        // completing old-set majority (self + 2, of 2) while new-set
+        // majority was already satisfied.
+        let node2_message = message_to(&heartbeat, NodeId(2)).expect("leader replicates to node 2");
+        let node2_response = cluster
+            .node_mut(NodeId(2))
+            .expect("known node")
+            .step(Event::Step {
+                from: NodeId(1),
+                message: node2_message,
+            });
+        cluster
+            .node_mut(NodeId(1))
+            .expect("known node")
+            .step(Event::Step {
+                from: NodeId(2),
+                message: message_to(&node2_response, NodeId(1)).expect("node 2 acks"),
+            });
+        assert_eq!(
+            cluster.node(NodeId(1)).expect("known node").commit_index(),
+            index
+        );
+    }
+
+    #[test]
+    fn remove_a_voter_including_leader_removal_steps_down_only_once_the_plain_config_commits() {
+        let peers = [NodeId(1), NodeId(2), NodeId(3)];
+        let mut cluster = Cluster::new(
+            peers
+                .iter()
+                .map(|&id| Node::new(id, peers.to_vec(), 1, 1).expect("valid node"))
+                .collect(),
+        )
+        .expect("valid cluster");
+
+        let requests = cluster
+            .node_mut(NodeId(1))
+            .expect("known node")
+            .step(Event::Tick { next_timeout: 10 });
+        deliver_until_quiescent(&mut cluster, &[], NodeId(1), requests);
+        assert_eq!(
+            cluster.node(NodeId(1)).expect("known node").role(),
+            Role::Leader
+        );
+        assert_at_most_one_leader(&cluster);
+
+        // The leader proposes removing itself: joint config, old {1,2,3},
+        // new {2,3}.
+        let (joint_index, _effects) = cluster
+            .node_mut(NodeId(1))
+            .expect("known node")
+            .propose_config_change(vec![NodeId(2), NodeId(3)])
+            .expect("leader accepts config change");
+
+        // Replicate and let the joint entry reach dual majority: old-set
+        // majority (2 of 3: self + either) and new-set majority (both 2
+        // and 3, since the new set has no overlap with the leader at all)
+        // are both satisfied once nodes 2 and 3 ack.
+        let heartbeat = cluster
+            .node_mut(NodeId(1))
+            .expect("known node")
+            .step(Event::Tick { next_timeout: 10 });
+        deliver_until_quiescent(&mut cluster, &[], NodeId(1), heartbeat);
+
+        assert_eq!(
+            cluster.node(NodeId(1)).expect("known node").commit_index(),
+            joint_index,
+            "the joint config must have committed"
+        );
+        // The leader appends the automatic C_new follow-up the instant the
+        // joint entry commits, even before that entry itself commits --
+        // current_config already excludes node 1 at this point, but
+        // commit_index hasn't caught up to it yet, so node 1 must still be
+        // leader here.
+        assert_eq!(
+            cluster.node(NodeId(1)).expect("known node").role(),
+            Role::Leader,
+            "the leader must not step down on the joint config committing -- only on the \
+             plain C_new"
+        );
+        assert_at_most_one_leader(&cluster);
+
+        // A second replication round is needed to carry the C_new
+        // follow-up the rest of the way (deliver_until_quiescent's
+        // reactive cascade above only re-contacts a peer that just sent a
+        // fresh ack -- node 3 never gets a second chance within that same
+        // pass). Once both nodes 2 and 3 ack it, C_new's own commit fires
+        // the leader's not-in-C_new step-down.
+        let heartbeat2 = cluster
+            .node_mut(NodeId(1))
+            .expect("known node")
+            .step(Event::Tick { next_timeout: 10 });
+        deliver_until_quiescent(&mut cluster, &[], NodeId(1), heartbeat2);
+
+        assert_eq!(
+            cluster.node(NodeId(1)).expect("known node").commit_index(),
+            joint_index + 1,
+            "the plain C_new follow-up must have committed too"
+        );
+        assert_eq!(
+            cluster.node(NodeId(1)).expect("known node").role(),
+            Role::Follower,
+            "the leader must step down once (and only once) C_new itself commits"
+        );
+        assert_at_most_one_leader(&cluster);
+    }
+
+    #[test]
+    fn a_learners_match_index_never_affects_commit_index_until_it_is_promoted() {
+        // A 2-voter base {1, 2} plus a learner (node 3), mirroring
+        // add_a_voter_new_set_majority_alone_does_not_commit_without_the_old_set_too's
+        // setup: it's the smallest shape where "count the learner in
+        // quorum" and "don't" actually disagree. With a 3-voter base, self
+        // + the learner alone would read as uncommitted either way (2 of a
+        // hypothetical 4-member union is still below its quorum of 3) --
+        // not a real test. Here, self + the learner alone is 2 of 2 under
+        // a (hypothetical, buggy) 3-member union {1,2,3} (quorum 2) --
+        // which would incorrectly commit -- versus the correct
+        // computation, which only ever consults voters = {1, 2}: self
+        // (caught up) and node 2 (still unacked, at 0) give candidate 0,
+        // not committed. Every assertion below checks this against real
+        // delivered acks, not by construction.
+        let mut cluster = Cluster::new(vec![
+            Node::new(NodeId(1), vec![NodeId(1), NodeId(2)], 1, 1).expect("valid node"),
+            Node::new(NodeId(2), vec![NodeId(1), NodeId(2)], 1, 1).expect("valid node"),
+            // Node::new_learner doesn't exist yet, so node 3 stands in for
+            // a real joiner: seeded with the eventual full voter set up
+            // front and a deliberately huge election timeout, so it can
+            // never self-elect before being genuinely admitted below.
+            Node::new(
+                NodeId(3),
+                vec![NodeId(1), NodeId(2), NodeId(3)],
+                1_000_000,
+                1,
+            )
+            .expect("valid node"),
+        ])
+        .expect("valid cluster");
+
+        let requests = cluster
+            .node_mut(NodeId(1))
+            .expect("known node")
+            .step(Event::Tick { next_timeout: 10 });
+        deliver_until_quiescent(&mut cluster, &[], NodeId(1), requests);
+        assert_eq!(
+            cluster.node(NodeId(1)).expect("known node").role(),
+            Role::Leader
+        );
+
+        cluster
+            .node_mut(NodeId(1))
+            .expect("known node")
+            .add_learner(NodeId(3));
+
+        let (index, _effects) = cluster
+            .node_mut(NodeId(1))
+            .expect("known node")
+            .propose(vec![9])
+            .expect("leader accepts propose");
+
+        let heartbeat = cluster
+            .node_mut(NodeId(1))
+            .expect("known node")
+            .step(Event::Tick { next_timeout: 10 });
+
+        // Deliver to the learner ONLY, through the same real
+        // Cluster/message delivery mechanism a voter uses -- proving it
+        // receives ordinary AppendEntries replication -- then feed its
+        // (fully caught-up) match_index claim back to the leader, still
+        // withholding node 2 entirely.
+        let learner_message =
+            message_to(&heartbeat, NodeId(3)).expect("the leader replicates to learners too");
+        let learner_response = cluster
+            .node_mut(NodeId(3))
+            .expect("known node")
+            .step(Event::Step {
+                from: NodeId(1),
+                message: learner_message,
+            });
+        assert_eq!(
+            cluster.node(NodeId(3)).expect("known node").log().len(),
+            1,
+            "the learner must actually receive and apply the entry"
+        );
+        cluster
+            .node_mut(NodeId(1))
+            .expect("known node")
+            .step(Event::Step {
+                from: NodeId(3),
+                message: message_to(&learner_response, NodeId(1)).expect("the learner acks"),
+            });
+        assert_eq!(
+            cluster.node(NodeId(1)).expect("known node").commit_index(),
+            0,
+            "self + the learner alone must not commit -- advance_commit_index only ever \
+             consults voters ({{1, 2}} here), never learners, so node 2's own progress (still \
+             0) is what actually gates this, no matter how caught up the learner claims to be"
+        );
+
+        // Node 2 -- the sole other real voter -- now also acks, reaching
+        // the voters-only quorum (2 of 2) on its own.
+        let voter_message =
+            message_to(&heartbeat, NodeId(2)).expect("the leader replicates to node 2");
+        let voter_response = cluster
+            .node_mut(NodeId(2))
+            .expect("known node")
+            .step(Event::Step {
+                from: NodeId(1),
+                message: voter_message,
+            });
+        cluster
+            .node_mut(NodeId(1))
+            .expect("known node")
+            .step(Event::Step {
+                from: NodeId(2),
+                message: message_to(&voter_response, NodeId(1)).expect("node 2 acks"),
+            });
+        assert_eq!(
+            cluster.node(NodeId(1)).expect("known node").commit_index(),
+            index
+        );
+
+        // Promote the learner to a full voter and drive the resulting
+        // joint transition (old {1,2}, new {1,2,3}) to completion -- same
+        // two-round shape as the remove-a-voter scenario, since the
+        // automatic C_new follow-up needs its own replication round.
+        let (promote_index, _effects) = cluster
+            .node_mut(NodeId(1))
+            .expect("known node")
+            .propose_config_change(vec![NodeId(1), NodeId(2), NodeId(3)])
+            .expect("leader accepts config change");
+        let promote_round1 = cluster
+            .node_mut(NodeId(1))
+            .expect("known node")
+            .step(Event::Tick { next_timeout: 10 });
+        deliver_until_quiescent(&mut cluster, &[], NodeId(1), promote_round1);
+        let promote_round2 = cluster
+            .node_mut(NodeId(1))
+            .expect("known node")
+            .step(Event::Tick { next_timeout: 10 });
+        deliver_until_quiescent(&mut cluster, &[], NodeId(1), promote_round2);
+
+        assert!(
+            cluster.node(NodeId(1)).expect("known node").commit_index() > promote_index,
+            "the promotion's automatic C_new follow-up must have committed too"
+        );
+        assert!(
+            cluster
+                .node(NodeId(1))
+                .expect("known node")
+                .voters()
+                .contains(&NodeId(3)),
+            "node 3 must now be a real voter"
+        );
+
+        // Node 3 now genuinely counts toward quorum: propose one more
+        // entry and deliver it to node 3 ONLY (withholding node 2 this
+        // time) -- the exact same delivery shape as the pre-promotion
+        // check above, but now committing, since self + node 3 (2 of the
+        // now-3 voters) meets the quorum on its own.
+        let (final_index, _effects) = cluster
+            .node_mut(NodeId(1))
+            .expect("known node")
+            .propose(vec![10])
+            .expect("leader accepts propose");
+        let final_heartbeat = cluster
+            .node_mut(NodeId(1))
+            .expect("known node")
+            .step(Event::Tick { next_timeout: 10 });
+
+        let message = message_to(&final_heartbeat, NodeId(3)).expect("leader replicates to node 3");
+        let response = cluster
+            .node_mut(NodeId(3))
+            .expect("known node")
+            .step(Event::Step {
+                from: NodeId(1),
+                message,
+            });
+        cluster
+            .node_mut(NodeId(1))
+            .expect("known node")
+            .step(Event::Step {
+                from: NodeId(3),
+                message: message_to(&response, NodeId(1)).expect("node 3 acks"),
+            });
+        assert_eq!(
+            cluster.node(NodeId(1)).expect("known node").commit_index(),
+            final_index,
+            "self + node 3 alone must now be enough -- node 3 is a real voter, not a learner, \
+             so its ack alone (without node 2) completes the quorum"
+        );
+    }
+
+    #[test]
+    fn a_removed_servers_stale_request_vote_does_not_depose_anyone_during_the_joint_window() {
+        let peers = [NodeId(1), NodeId(2), NodeId(3)];
+        let mut cluster = Cluster::new(
+            peers
+                .iter()
+                .map(|&id| Node::new(id, peers.to_vec(), 1, 1).expect("valid node"))
+                .collect(),
+        )
+        .expect("valid cluster");
+
+        // Node 1 wins term 1 uncontested; nodes 2 and 3 both just heard
+        // from it, so both have leader_contact_elapsed == 0.
+        let requests = cluster
+            .node_mut(NodeId(1))
+            .expect("known node")
+            .step(Event::Tick { next_timeout: 10 });
+        deliver_until_quiescent(&mut cluster, &[], NodeId(1), requests);
+        assert_eq!(
+            cluster.node(NodeId(1)).expect("known node").role(),
+            Role::Leader
+        );
+
+        // The leader proposes removing node 3: joint config, old {1,2,3},
+        // new {1,2}. This takes effect on the leader immediately, even
+        // before it commits.
+        cluster
+            .node_mut(NodeId(1))
+            .expect("known node")
+            .propose_config_change(vec![NodeId(1), NodeId(2)])
+            .expect("leader accepts config change");
+        assert!(
+            cluster
+                .node(NodeId(1))
+                .expect("known node")
+                .current_config()
+                .is_joint(),
+            "the joint config must be active on the leader immediately"
+        );
+
+        // Node 3 is partitioned from here on: nothing is delivered to or
+        // from it through ordinary routing again, but it still exists in
+        // `cluster` and keeps ticking on its own like a real isolated
+        // process would, eventually timing out and starting a new
+        // election at a higher term -- exactly the scenario the
+        // disruption guard exists for.
+        let mut node3_campaign = Vec::new();
+        for _ in 0..5 {
+            node3_campaign = cluster
+                .node_mut(NodeId(3))
+                .expect("known node")
+                .step(Event::Tick { next_timeout: 5 });
+            if !node3_campaign.is_empty() {
+                break;
+            }
+        }
+        let stale_term = cluster.node(NodeId(3)).expect("known node").current_term();
+        assert!(
+            stale_term > 1,
+            "node 3 must have started a new, higher-term election"
+        );
+
+        // Deliver node 3's stale RequestVote straight to the leader. The
+        // Role::Leader half of the guard is unconditional (not scoped to
+        // the joint window), but the joint config is still active on the
+        // leader right now too, since nothing has replicated yet.
+        let leader_message =
+            message_to(&node3_campaign, NodeId(1)).expect("node 3 requests node 1's vote");
+        let leader_response = cluster
+            .node_mut(NodeId(1))
+            .expect("known node")
+            .step(Event::Step {
+                from: NodeId(3),
+                message: leader_message,
+            });
+        assert_eq!(
+            cluster.node(NodeId(1)).expect("known node").role(),
+            Role::Leader,
+            "the leader must not step down on a RequestVote, even a higher-term one"
+        );
+        assert_eq!(
+            cluster.node(NodeId(1)).expect("known node").current_term(),
+            1
+        );
+        assert_eq!(
+            leader_response,
+            vec![Effect::Send {
+                to: NodeId(3),
+                message: Message::RequestVoteResponse(RequestVoteResponse {
+                    term: 1,
+                    granted: false,
+                }),
+            }]
+        );
+
+        // Now replicate the joint entry to node 2 only (node 3 stays
+        // isolated) and let the leader observe node 2's ack -- this
+        // reaches dual majority (old {1,2,3}: self + 2; new {1,2}: self +
+        // 2, both members) and commits the joint entry, which immediately
+        // appends the automatic C_new follow-up on the leader. Node 2 has
+        // NOT received that follow-up yet -- it needs a second heartbeat
+        // round -- so node 2 is still in the joint window right now. This
+        // is exactly the window this test needs to exercise: once node 2
+        // also gets the follow-up, is_member alone would already drop
+        // node 3's messages, which proves nothing about this guard.
+        let heartbeat = cluster
+            .node_mut(NodeId(1))
+            .expect("known node")
+            .step(Event::Tick { next_timeout: 5 });
+        let node2_message = message_to(&heartbeat, NodeId(2)).expect("leader replicates to node 2");
+        let node2_response = cluster
+            .node_mut(NodeId(2))
+            .expect("known node")
+            .step(Event::Step {
+                from: NodeId(1),
+                message: node2_message,
+            });
+        cluster
+            .node_mut(NodeId(1))
+            .expect("known node")
+            .step(Event::Step {
+                from: NodeId(2),
+                message: message_to(&node2_response, NodeId(1)).expect("node 2 acks"),
+            });
+        assert!(
+            cluster
+                .node(NodeId(2))
+                .expect("known node")
+                .current_config()
+                .is_joint(),
+            "node 2 must still be in the joint window -- it hasn't received the C_new \
+             follow-up yet"
+        );
+
+        // Node 2 has not been ticked since the AppendEntries above reset
+        // its leader_contact_elapsed to 0, so the joint-scoped
+        // Follower/Candidate guard must fire: node 3's stale, higher-term
+        // RequestVote must be rejected without granting or stepping down.
+        let node2_message =
+            message_to(&node3_campaign, NodeId(2)).expect("node 3 requests node 2's vote");
+        let node2_guard_response =
+            cluster
+                .node_mut(NodeId(2))
+                .expect("known node")
+                .step(Event::Step {
+                    from: NodeId(3),
+                    message: node2_message,
+                });
+        assert_eq!(
+            cluster.node(NodeId(2)).expect("known node").role(),
+            Role::Follower
+        );
+        assert_eq!(
+            cluster.node(NodeId(2)).expect("known node").current_term(),
+            1
+        );
+        assert_eq!(
+            node2_guard_response,
+            vec![Effect::Send {
+                to: NodeId(3),
+                message: Message::RequestVoteResponse(RequestVoteResponse {
+                    term: 1,
+                    granted: false,
+                }),
+            }]
+        );
+
+        assert_at_most_one_leader(&cluster);
+    }
+
+    #[test]
+    fn full_quorum_overlap_sweep_never_shows_two_leaders_in_the_same_term() {
+        // The most direct proof of the roadmap gate's literal wording: a
+        // longer seeded schedule interleaving several add/remove
+        // config-change operations amid ordinary ticks/message delivery,
+        // still holding leaders().len() <= 1 and single-leader-per-term
+        // throughout.
+        let cluster = Cluster::new(vec![
+            Node::new(NodeId(1), vec![NodeId(1), NodeId(2), NodeId(3)], 5, 1).expect("valid node"),
+            Node::new(NodeId(2), vec![NodeId(1), NodeId(2), NodeId(3)], 5, 1).expect("valid node"),
+            Node::new(NodeId(3), vec![NodeId(1), NodeId(2), NodeId(3)], 5, 1).expect("valid node"),
+            // Node::new_learner doesn't exist yet -- these two stand in
+            // for real joiners with the eventual full voter set
+            // pre-seeded and a deliberately huge election timeout, so
+            // they can never win an election on their own before being
+            // genuinely admitted by the leader's replication.
+            Node::new(
+                NodeId(4),
+                vec![NodeId(1), NodeId(2), NodeId(3), NodeId(4)],
+                1_000_000,
+                1,
+            )
+            .expect("valid node"),
+            Node::new(
+                NodeId(5),
+                vec![NodeId(1), NodeId(2), NodeId(3), NodeId(4), NodeId(5)],
+                1_000_000,
+                1,
+            )
+            .expect("valid node"),
+        ])
+        .expect("valid cluster");
+
+        let mut simulation = Simulation::new(cluster, 20260820, 3, 6, 1, 2);
+
+        let mut leader_by_term: BTreeMap<u64, NodeId> = BTreeMap::new();
+        let mut added_4 = false;
+        let mut added_5 = false;
+        let mut removed_2 = false;
+
+        for tick in 0..1_000u64 {
+            simulation.step();
+
+            let leaders = simulation.leaders();
+            assert!(
+                leaders.len() <= 1,
+                "no more than one leader may exist at once, saw {leaders:?} at tick {tick}"
+            );
+            for &(id, term) in &leaders {
+                match leader_by_term.get(&term) {
+                    Some(&existing) if existing != id => {
+                        panic!(
+                            "two different leaders observed in term {term}: {existing:?} \
+                             and {id:?} at tick {tick}"
+                        );
+                    }
+                    _ => {
+                        leader_by_term.insert(term, id);
+                    }
+                }
+            }
+
+            let Some(&(leader_id, _)) = leaders.first() else {
+                continue;
+            };
+            let voters = simulation
+                .node(leader_id)
+                .expect("leader is a known node")
+                .voters()
+                .to_vec();
+
+            if !added_4 && tick > 50 && !voters.contains(&NodeId(4)) {
+                simulation.add_learner(leader_id, NodeId(4));
+                let mut new_voters = voters.clone();
+                new_voters.push(NodeId(4));
+                new_voters.sort();
+                // Gated on the call actually succeeding (Some), not merely
+                // being made -- a leader that lost the role between
+                // reading `leaders()` above and this call would silently
+                // reject it (propose_config_change returns None for a
+                // non-leader), and a flag set regardless would make the
+                // final assertion below pass without the sweep having
+                // done anything.
+                if simulation
+                    .propose_config_change(leader_id, new_voters)
+                    .is_some()
+                {
+                    added_4 = true;
+                }
+            } else if added_4 && !added_5 && tick > 150 && !voters.contains(&NodeId(5)) {
+                simulation.add_learner(leader_id, NodeId(5));
+                let mut new_voters = voters.clone();
+                new_voters.push(NodeId(5));
+                new_voters.sort();
+                if simulation
+                    .propose_config_change(leader_id, new_voters)
+                    .is_some()
+                {
+                    added_5 = true;
+                }
+            } else if added_5 && !removed_2 && tick > 250 && voters.contains(&NodeId(2)) {
+                let new_voters: Vec<NodeId> =
+                    voters.into_iter().filter(|&id| id != NodeId(2)).collect();
+                if simulation
+                    .propose_config_change(leader_id, new_voters)
+                    .is_some()
+                {
+                    removed_2 = true;
+                }
+            }
+        }
+
+        assert!(
+            added_4 && added_5 && removed_2,
+            "the sweep must actually exercise all three config-change operations, not just \
+             ticks"
+        );
+
+        // Proving the three calls fired proves nothing about whether any
+        // of them actually committed -- assert real end-state convergence
+        // too: node 1 was never removed, so its own current_config is the
+        // final word on whether the whole sequence (add 4, add 5, remove
+        // 2) genuinely replicated and committed, not just got proposed and
+        // then lost to a subsequent election or dropped message.
+        let final_config = simulation
+            .node(NodeId(1))
+            .expect("node 1 is a known node")
+            .current_config()
+            .clone();
+        assert_eq!(
+            final_config.voters,
+            vec![NodeId(1), NodeId(3), NodeId(4), NodeId(5)],
+            "the sweep must actually converge to the final voter set"
+        );
+        assert!(
+            final_config.old_voters.is_none(),
+            "the final config change (removing node 2) must have fully committed -- past its \
+             joint phase, not just proposed"
         );
     }
 }
