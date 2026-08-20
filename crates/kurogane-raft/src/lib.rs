@@ -741,8 +741,27 @@ impl Node {
     /// tracking. (A learner's own incoming `AppendEntries` *from* its
     /// leader already passes today, since the leader is always a voter --
     /// this widening is about the reverse direction.)
+    ///
+    /// Third clause: a brand-new `Node::new_learner` node's own
+    /// `current_config` is genuinely empty (`voters: []`, `old_voters:
+    /// None`) -- by construction, the *only* path that ever produces that
+    /// shape, since `Node::new`/`Node::recover` both reject an empty
+    /// bootstrap set and `propose_config_change` rejects an empty
+    /// `new_voters`. Without this clause, such a node's very first contact
+    /// -- the leader's own `AddLearner`-triggered `AppendEntries`/
+    /// `InstallSnapshot` -- would itself fail this check (it's judged
+    /// against *this* node's config, not the sender's), permanently
+    /// deadlocking the join: the node can never learn who its leader is,
+    /// because it refuses to listen to anyone before it already knows. The
+    /// real trust boundary for this first contact is the runtime's shared
+    /// cluster-token authentication, not this predicate -- once a real
+    /// `AppendEntries`/`InstallSnapshot` lands and installs a real
+    /// configuration, `current_config.voters` is no longer empty and this
+    /// bypass naturally stops applying.
     fn is_member(&self, id: NodeId) -> bool {
-        self.current_config.is_voter(id) || self.learners.contains(&id)
+        self.current_config.is_voter(id)
+            || self.learners.contains(&id)
+            || (self.current_config.voters.is_empty() && self.current_config.old_voters.is_none())
     }
 
     /// Position of absolute `index` within `log`. Callers must ensure
@@ -1902,6 +1921,56 @@ mod tests {
         assert_eq!(
             Node::new_learner(NodeId(1), 1, 2).unwrap_err(),
             ConfigError::HeartbeatIntervalExceedsElectionTimeout
+        );
+    }
+
+    #[test]
+    fn a_join_mode_node_accepts_its_first_append_entries_from_an_unrecognized_sender() {
+        // A fresh Node::new_learner has an empty current_config -- is_member
+        // judges the *sender* against this node's own config, so without a
+        // bypass for the genuinely-unconfigured case, this node would
+        // reject the very first AppendEntries that's supposed to admit it,
+        // deadlocking the join permanently (it can never learn who its
+        // leader is, because it refuses to listen to anyone first).
+        let mut node = Node::new_learner(NodeId(4), 5, 1).expect("valid join-mode node");
+
+        let effects = node.step(Event::Step {
+            from: NodeId(1),
+            message: Message::AppendEntries(AppendEntries {
+                term: 1,
+                leader_id: NodeId(1),
+                prev_log_index: 0,
+                prev_log_term: 0,
+                entries: vec![LogEntry {
+                    term: 1,
+                    payload: LogPayload::Configuration(ClusterConfig {
+                        voters: vec![NodeId(1), NodeId(2), NodeId(3)],
+                        old_voters: None,
+                    }),
+                }],
+                leader_commit: 0,
+            }),
+        });
+
+        assert!(
+            effects.iter().any(|effect| matches!(
+                effect,
+                Effect::Send {
+                    message: Message::AppendEntriesResponse(response),
+                    ..
+                } if response.success
+            )),
+            "the join-mode node must accept a real leader's first AppendEntries, not silently \
+             drop it via is_member, got {effects:?}"
+        );
+        assert_eq!(
+            node.current_config(),
+            &ClusterConfig {
+                voters: vec![NodeId(1), NodeId(2), NodeId(3)],
+                old_voters: None,
+            },
+            "the AppendEntries carried a Configuration entry admitting this node's cluster -- \
+             current_config must reflect it immediately"
         );
     }
 
