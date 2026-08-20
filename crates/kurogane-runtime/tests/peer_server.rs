@@ -11,7 +11,7 @@ use kurogane_runtime::actor::{self, Actor, PeerTransport};
 use kurogane_runtime::auth::{TokenInterceptor, attach_token};
 use kurogane_runtime::proto::raft_peer_client::RaftPeerClient;
 use kurogane_runtime::proto::raft_peer_server::RaftPeerServer;
-use kurogane_runtime::proto::{InstallSnapshotRequest, RequestVoteRequest};
+use kurogane_runtime::proto::{Configuration, InstallSnapshotRequest, RequestVoteRequest};
 use kurogane_runtime::server::RaftPeerService;
 use kurogane_runtime::storage::Storage;
 use tempfile::tempdir;
@@ -107,6 +107,10 @@ async fn an_install_snapshot_round_trips_over_a_real_socket() {
             last_included_index: 5,
             last_included_term: 1,
             data: Vec::new(),
+            config: Some(Configuration {
+                voters: vec![1, 2],
+                old_voters: Vec::new(),
+            }),
         }),
         TOKEN,
     );

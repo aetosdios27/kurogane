@@ -147,6 +147,20 @@ pub fn install_snapshot_from_proto(proto: proto::InstallSnapshotRequest) -> Inst
         last_included_index: proto.last_included_index,
         last_included_term: proto.last_included_term,
         data: proto.data,
+        // Every real sender (replicate_to) always populates this with its
+        // own non-empty snapshot_config -- recover validates a non-empty
+        // peers set, and compact/on_install_snapshot both keep
+        // snapshot_config in lockstep with it from then on -- so an absent
+        // Configuration here would mean a malformed message, not a
+        // legitimate "no config" case. unwrap_or_default rather than a
+        // fallible Result: a genuinely absent config on this specific
+        // field can't happen given the invariant above, unlike
+        // log_entry_from_proto's payload oneof, which really can be unset
+        // on the wire.
+        config: proto
+            .config
+            .map(configuration_from_proto)
+            .unwrap_or_default(),
     }
 }
 
@@ -157,6 +171,7 @@ pub fn install_snapshot_to_proto(value: InstallSnapshot) -> proto::InstallSnapsh
         last_included_index: value.last_included_index,
         last_included_term: value.last_included_term,
         data: value.data,
+        config: Some(configuration_to_proto(value.config)),
     }
 }
 
@@ -307,6 +322,10 @@ mod tests {
             last_included_index: 7,
             last_included_term: 2,
             data: vec![9, 9, 9],
+            config: ClusterConfig {
+                voters: vec![NodeId(1), NodeId(2)],
+                old_voters: Some(vec![NodeId(1), NodeId(3)]),
+            },
         };
 
         assert_eq!(

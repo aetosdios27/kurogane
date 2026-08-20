@@ -113,6 +113,12 @@ impl Storage {
                 last_included_index,
                 last_included_term,
                 data,
+                // Real snapshot-config persistence in Storage/StorageState
+                // is separate, later cross-crate work, not this stage's
+                // job -- ignored here only to keep the workspace compiling
+                // against the widened Effect variant, same treatment as
+                // PersistLearners below.
+                config: _,
             } => {
                 self.snapshot = SnapshotMetadata {
                     last_included_index: *last_included_index,
@@ -148,7 +154,7 @@ impl Storage {
 
 #[cfg(test)]
 mod tests {
-    use kurogane_raft::{HardState, LogEntry, LogPayload, NodeId};
+    use kurogane_raft::{ClusterConfig, HardState, LogEntry, LogPayload, NodeId};
     use tempfile::tempdir;
 
     use super::*;
@@ -259,6 +265,10 @@ mod tests {
                 last_included_index: 3,
                 last_included_term: 1,
                 data: vec![9, 9],
+                config: ClusterConfig {
+                    voters: vec![NodeId(1)],
+                    old_voters: None,
+                },
             })
             .expect("persist snapshot");
         storage

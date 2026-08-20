@@ -37,7 +37,7 @@ pub struct RequestVoteResponse {
 /// while a transition is in flight, holding the set being replaced. Both
 /// sets must independently reach majority for anything — an election or a
 /// commit — to succeed while `old_voters` is `Some`.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct ClusterConfig {
     pub voters: Vec<NodeId>,
     pub old_voters: Option<Vec<NodeId>>,
@@ -110,6 +110,11 @@ pub struct InstallSnapshot {
     pub last_included_index: u64,
     pub last_included_term: u64,
     pub data: Vec<u8>,
+    /// The membership active as of this snapshot's boundary, so a receiver
+    /// that catches up purely through this transfer (never having seen the
+    /// `Configuration` log entries it summarizes) still learns current
+    /// membership — see `Effect::PersistSnapshot`'s identical field.
+    pub config: ClusterConfig,
 }
 
 /// The response to an `InstallSnapshot`. `last_included_index` echoes back
@@ -173,6 +178,15 @@ pub enum Effect {
         last_included_index: u64,
         last_included_term: u64,
         data: Vec<u8>,
+        /// The membership active as of this snapshot's boundary. Compaction
+        /// can discard the very log entries that established the current
+        /// configuration, so — exactly like `last_included_index`/
+        /// `last_included_term` — the boundary must carry membership
+        /// forward explicitly, or a node that recovers or catches up
+        /// purely from a snapshot transfer (not ordinary log replication)
+        /// has no way to learn it. Mirrors `Node`'s own in-memory
+        /// `snapshot_config` field one-for-one.
+        config: ClusterConfig,
     },
     /// Replaces the durable learner set with `learners`. A separate effect
     /// from `PersistSnapshot` rather than folded into it: the learner set
@@ -217,6 +231,10 @@ pub struct SnapshotMetadata {
 pub struct Snapshot {
     pub metadata: SnapshotMetadata,
     pub data: Vec<u8>,
+    /// The membership active as of `metadata`'s boundary — see
+    /// `Effect::PersistSnapshot`'s identical field for why this travels
+    /// alongside the boundary rather than being re-derived.
+    pub config: ClusterConfig,
 }
 
 /// Invalid construction of a Raft node.
@@ -728,6 +746,7 @@ impl Node {
                     last_included_index: self.snapshot.last_included_index,
                     last_included_term: self.snapshot.last_included_term,
                     data: self.snapshot_data.clone(),
+                    config: self.snapshot_config.clone(),
                 }),
             };
         }
@@ -1169,12 +1188,21 @@ impl Node {
                 last_included_term: request.last_included_term,
             };
             self.snapshot_data = request.data.clone();
+            self.snapshot_config = request.config.clone();
             self.commit_index = self.commit_index.max(request.last_included_index);
+            // The log this snapshot summarizes is gone (cleared above), so
+            // recompute_config's fallback chain now resolves to exactly
+            // the snapshot_config just installed -- unless a genuinely
+            // more recent Configuration entry somehow survives above the
+            // new boundary, which recompute_config's existing logic
+            // already handles correctly by construction.
+            self.recompute_config();
 
             effects.push(Effect::PersistSnapshot {
                 last_included_index: request.last_included_index,
                 last_included_term: request.last_included_term,
                 data: request.data,
+                config: request.config,
             });
             // PersistSnapshot alone doesn't fully describe post-install log
             // state -- pin down that nothing survives above the new
@@ -1616,6 +1644,7 @@ impl Node {
                 last_included_index: up_to_index,
                 last_included_term,
                 data: snapshot_data,
+                config: self.snapshot_config.clone(),
             },
             // PersistSnapshot alone doesn't tell the owner's durable log to
             // drop the now-redundant compacted prefix -- pin it down
@@ -1768,6 +1797,7 @@ mod tests {
             Snapshot {
                 metadata: snapshot,
                 data: vec![7, 7, 7],
+                config: ClusterConfig::default(),
             },
             Vec::new(),
         )
@@ -3092,6 +3122,10 @@ mod tests {
                 last_included_index: 5,
                 last_included_term: 0,
                 data: vec![9],
+                config: ClusterConfig {
+                    voters: vec![NodeId(1), NodeId(2), NodeId(3)],
+                    old_voters: None,
+                },
             }),
         });
 
@@ -3123,6 +3157,10 @@ mod tests {
                 last_included_index: 5,
                 last_included_term: 1,
                 data: vec![9],
+                config: ClusterConfig {
+                    voters: vec![NodeId(1), NodeId(2), NodeId(3)],
+                    old_voters: None,
+                },
             }),
         });
 
@@ -3150,6 +3188,17 @@ mod tests {
         });
         assert_eq!(node.log().len(), 1);
 
+        // The transferred config differs from the receiver's own prior
+        // config (established at construction from `peers`) -- this is the
+        // scenario a learner or a very-far-behind node hits in practice: it
+        // never saw the Configuration log entries directly, only the
+        // compacted-away result, so this InstallSnapshot is its only way to
+        // learn current membership.
+        let installed_config = ClusterConfig {
+            voters: vec![NodeId(1), NodeId(2), NodeId(4)],
+            old_voters: None,
+        };
+
         let effects = node.step(Event::Step {
             from: NodeId(2),
             message: Message::InstallSnapshot(InstallSnapshot {
@@ -3158,6 +3207,7 @@ mod tests {
                 last_included_index: 5,
                 last_included_term: 1,
                 data: vec![9, 9],
+                config: installed_config.clone(),
             }),
         });
 
@@ -3172,6 +3222,9 @@ mod tests {
         assert!(node.log().is_empty());
         assert_eq!(node.commit_index(), 5);
         assert_eq!(node.last_log_index(), 5);
+        // The receiver's current_config() now matches the transferred
+        // snapshot's config, not the stale one it started with.
+        assert_eq!(node.current_config(), &installed_config);
         assert_eq!(
             effects,
             vec![
@@ -3179,6 +3232,7 @@ mod tests {
                     last_included_index: 5,
                     last_included_term: 1,
                     data: vec![9, 9],
+                    config: installed_config,
                 },
                 Effect::PersistLog {
                     from_index: 6,
@@ -3210,6 +3264,10 @@ mod tests {
                 last_included_index: 3,
                 last_included_term: 2,
                 data: vec![1],
+                config: ClusterConfig {
+                    voters: vec![NodeId(1), NodeId(2), NodeId(3)],
+                    old_voters: None,
+                },
             }),
         });
 
@@ -3227,6 +3285,10 @@ mod tests {
                     last_included_index: 3,
                     last_included_term: 2,
                     data: vec![1],
+                    config: ClusterConfig {
+                        voters: vec![NodeId(1), NodeId(2), NodeId(3)],
+                        old_voters: None,
+                    },
                 },
                 Effect::PersistLog {
                     from_index: 4,
@@ -3281,12 +3343,27 @@ mod tests {
                 last_included_index: 1,
                 last_included_term: 1,
                 data: vec![9, 9],
+                // Deliberately different from the receiver's own config --
+                // a no-op must leave snapshot_config/current_config
+                // untouched exactly as it already leaves snapshot/
+                // snapshot_data/log untouched.
+                config: ClusterConfig {
+                    voters: vec![NodeId(1), NodeId(2), NodeId(9)],
+                    old_voters: None,
+                },
             }),
         });
 
         assert_eq!(node.log().len(), 2);
         assert_eq!(node.snapshot(), SnapshotMetadata::default());
         assert!(node.snapshot_data().is_empty());
+        assert_eq!(
+            node.current_config(),
+            &ClusterConfig {
+                voters: vec![NodeId(1), NodeId(2), NodeId(3)],
+                old_voters: None,
+            }
+        );
         assert_eq!(
             effects,
             vec![Effect::Send {
@@ -4062,6 +4139,10 @@ mod tests {
                     last_included_index: 2,
                     last_included_term: 1,
                     data: vec![9, 9],
+                    config: ClusterConfig {
+                        voters: vec![NodeId(1)],
+                        old_voters: None,
+                    },
                 },
                 Effect::PersistLog {
                     from_index: 3,
@@ -4116,6 +4197,10 @@ mod tests {
                     last_included_index: 2,
                     last_included_term: 1,
                     data: vec![9],
+                    config: ClusterConfig {
+                        voters: vec![NodeId(1)],
+                        old_voters: None,
+                    },
                 },
                 Effect::PersistLog {
                     from_index: 3,
@@ -4124,6 +4209,56 @@ mod tests {
             ]
         );
         assert!(node.log().is_empty());
+    }
+
+    #[test]
+    fn compact_captures_an_active_configuration_entry_into_the_snapshot() {
+        let mut node = Node::new(NodeId(1), vec![NodeId(1)], 1, 1).expect("valid node");
+        node.step(Event::Tick { next_timeout: 5 });
+        node.propose(vec![1]);
+        assert_eq!(node.commit_index(), 1);
+
+        // Appends a joint Configuration entry adding NodeId(2). It takes
+        // effect immediately (current_config() is live, not commit-gated),
+        // but stays uncommitted here: dual-majority requires NodeId(2)'s
+        // own ack for the new-side quorum, which never arrives in this
+        // test -- commit_index stays at 1.
+        let joint_config = ClusterConfig {
+            voters: vec![NodeId(1), NodeId(2)],
+            old_voters: Some(vec![NodeId(1)]),
+        };
+        node.propose_config_change(vec![NodeId(1), NodeId(2)])
+            .expect("leader accepts propose_config_change");
+        assert_eq!(node.current_config(), &joint_config);
+        assert_eq!(node.commit_index(), 1);
+
+        // Compacting only through the still-committed index 1 -- the
+        // config entry at index 2 is untouched by the drain, but the
+        // snapshot must still capture the config that's live right now,
+        // exactly as compact()'s own doc comment says.
+        let effects = node.compact(1, vec![9]).expect("1 is committed");
+
+        assert_eq!(
+            effects,
+            vec![
+                Effect::PersistSnapshot {
+                    last_included_index: 1,
+                    last_included_term: 1,
+                    data: vec![9],
+                    config: joint_config.clone(),
+                },
+                Effect::PersistLog {
+                    from_index: 2,
+                    entries: vec![LogEntry {
+                        term: 1,
+                        payload: LogPayload::Configuration(joint_config.clone()),
+                    }],
+                },
+            ]
+        );
+        // The config entry itself survived the drain (it's above the new
+        // boundary), so current_config() is unaffected by compacting.
+        assert_eq!(node.current_config(), &joint_config);
     }
 
     #[test]
@@ -4324,6 +4459,10 @@ mod tests {
                         last_included_index: 3,
                         last_included_term: 1,
                         data: vec![9, 9],
+                        config: ClusterConfig {
+                            voters: vec![NodeId(1), NodeId(2), NodeId(3)],
+                            old_voters: None,
+                        },
                     }),
                 },
             ]

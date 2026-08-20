@@ -63,6 +63,12 @@ message InstallSnapshotRequest {
   uint64 last_included_index = 3;
   uint64 last_included_term = 4;
   bytes data = 5;
+  // The membership active as of this snapshot's boundary -- without this,
+  // a receiver that catches up purely through this transfer (never having
+  // seen the Configuration log entries it summarizes) has no way to learn
+  // current membership, and silently drops every later message from its
+  // own leader once is_member() no longer recognizes it.
+  Configuration config = 6;
 }
 
 message InstallSnapshotReply {

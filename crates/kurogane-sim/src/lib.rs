@@ -170,6 +170,12 @@ impl DurableState {
                 last_included_index,
                 last_included_term,
                 data,
+                // Real snapshot-config persistence in DurableState is
+                // separate, later cross-crate work, not this stage's job --
+                // ignored here only to keep the workspace compiling against
+                // the widened Effect variant, same treatment as
+                // PersistLearners below.
+                config: _,
             } => {
                 self.snapshot = SnapshotMetadata {
                     last_included_index: *last_included_index,
@@ -353,7 +359,8 @@ impl Simulation {
 #[cfg(test)]
 mod tests {
     use kurogane_raft::{
-        Effect, HardState, LogEntry, LogPayload, Node, NodeId, Snapshot, SnapshotMetadata,
+        ClusterConfig, Effect, HardState, LogEntry, LogPayload, Node, NodeId, Snapshot,
+        SnapshotMetadata,
     };
 
     use super::{Cluster, ClusterError, DurableState};
@@ -525,6 +532,10 @@ mod tests {
             last_included_index: 3,
             last_included_term: 1,
             data: vec![9, 9],
+            config: ClusterConfig {
+                voters: vec![NodeId(1)],
+                old_voters: None,
+            },
         });
         durable.apply(&Effect::PersistLog {
             from_index: 4,
@@ -582,7 +593,7 @@ mod simulation_tests {
     use std::collections::BTreeMap;
 
     use kurogane_raft::{
-        AppendEntries, AppendEntriesResponse, Effect, Event, InstallSnapshot,
+        AppendEntries, AppendEntriesResponse, ClusterConfig, Effect, Event, InstallSnapshot,
         InstallSnapshotResponse, LogEntry, LogPayload, Message, Node, NodeId, RequestVote,
         RequestVoteResponse, Role, Snapshot, SnapshotMetadata,
     };
@@ -1213,6 +1224,10 @@ mod simulation_tests {
                     last_included_index: 1,
                     last_included_term: 1,
                     data: vec![0xFF],
+                    config: ClusterConfig {
+                        voters: vec![NodeId(1), NodeId(2), NodeId(3)],
+                        old_voters: None,
+                    },
                 }),
             });
 
@@ -1411,6 +1426,7 @@ mod simulation_tests {
             Snapshot {
                 metadata: durable.snapshot(),
                 data: durable.snapshot_data().to_vec(),
+                config: ClusterConfig::default(),
             },
             Vec::new(),
         )
@@ -1476,6 +1492,7 @@ mod simulation_tests {
             Snapshot {
                 metadata: durable.snapshot(),
                 data: durable.snapshot_data().to_vec(),
+                config: ClusterConfig::default(),
             },
             Vec::new(),
         )
@@ -1529,6 +1546,7 @@ mod simulation_tests {
             Snapshot {
                 metadata: durable.snapshot(),
                 data: durable.snapshot_data().to_vec(),
+                config: ClusterConfig::default(),
             },
             Vec::new(),
         )

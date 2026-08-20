@@ -354,7 +354,8 @@ mod tests {
     use std::collections::BTreeMap;
 
     use kurogane_raft::{
-        AppendEntries, InstallSnapshot, LogEntry, LogPayload, Message, Node, NodeId, Role,
+        AppendEntries, ClusterConfig, InstallSnapshot, LogEntry, LogPayload, Message, Node, NodeId,
+        Role,
     };
 
     use super::{ApplyResult, Command, DecodeError, Effect, Event, Replica, StateMachine};
@@ -708,6 +709,10 @@ mod tests {
                 last_included_index: 5,
                 last_included_term: 1,
                 data,
+                config: ClusterConfig {
+                    voters: vec![NodeId(1), NodeId(2), NodeId(3)],
+                    old_voters: None,
+                },
             }),
         });
 

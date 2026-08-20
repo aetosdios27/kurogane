@@ -10,7 +10,7 @@ use std::net::SocketAddr;
 use std::time::Duration;
 
 use kurogane_kv::Replica;
-use kurogane_raft::{Node, NodeId, Snapshot};
+use kurogane_raft::{ClusterConfig, Node, NodeId, Snapshot};
 use kurogane_runtime::actor::{self, Actor};
 use kurogane_runtime::auth::TokenInterceptor;
 use kurogane_runtime::peer_client::GrpcPeerTransport;
@@ -88,6 +88,10 @@ async fn main() {
         Snapshot {
             metadata: storage.snapshot(),
             data: storage.snapshot_data().to_vec(),
+            // Storage doesn't yet round-trip a persisted snapshot config --
+            // durable snapshot-config handling in Storage/StorageState is
+            // separate, later cross-crate work, not this stage's job.
+            config: ClusterConfig::default(),
         },
         // Storage doesn't yet round-trip a persisted learner set --
         // durable PersistLearners handling in Storage/StorageState is
