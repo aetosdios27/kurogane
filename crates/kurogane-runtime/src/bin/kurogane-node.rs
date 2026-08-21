@@ -10,7 +10,7 @@ use std::net::SocketAddr;
 use std::time::Duration;
 
 use kurogane_kv::Replica;
-use kurogane_raft::{ClusterConfig, Node, NodeId, Snapshot};
+use kurogane_raft::{HardState, Node, NodeId, Snapshot};
 use kurogane_runtime::actor::{self, Actor};
 use kurogane_runtime::auth::TokenInterceptor;
 use kurogane_runtime::peer_client::GrpcPeerTransport;
@@ -76,29 +76,65 @@ async fn main() {
     let heartbeat_interval_ticks: u64 = env_var_or("KUROGANE_HEARTBEAT_INTERVAL_TICKS", 2);
     let tick_interval_ms: u64 = env_var_or("KUROGANE_TICK_INTERVAL_MS", 50);
     let compact_threshold: u64 = env_var_or("KUROGANE_COMPACT_THRESHOLD", 50);
+    // Set (any value works; a simple presence-style flag, same idiom this
+    // file already uses via env_var_or's generic parse -- bool's own
+    // FromStr accepts exactly "true"/"false") on a brand-new node that's
+    // joining an already-running cluster rather than bootstrapping one from
+    // scratch. See the Node::new_learner branch below for exactly what this
+    // changes and doesn't.
+    let join_as_learner: bool = env_var_or("KUROGANE_JOIN_AS_LEARNER", false);
 
     let storage = Storage::open(storage_path).expect("open durable storage");
-    let node = Node::recover(
-        id,
-        member_ids,
-        election_timeout_ticks,
-        heartbeat_interval_ticks,
-        storage.hard_state(),
-        storage.log().to_vec(),
-        Snapshot {
-            metadata: storage.snapshot(),
-            data: storage.snapshot_data().to_vec(),
-            // Storage doesn't yet round-trip a persisted snapshot config --
-            // durable snapshot-config handling in Storage/StorageState is
-            // separate, later cross-crate work, not this stage's job.
-            config: ClusterConfig::default(),
-        },
-        // Storage doesn't yet round-trip a persisted learner set --
-        // durable PersistLearners handling in Storage/StorageState is
-        // separate, later cross-crate work, not this stage's job.
-        Vec::new(),
-    )
-    .expect("valid node configuration");
+
+    // "Fresh" here means this node has never actually recovered anything
+    // real yet -- no hard state, no log, no snapshot. Only then is it safe
+    // to start via Node::new_learner: a *restart* of an already-admitted
+    // learner/voter (KUROGANE_JOIN_AS_LEARNER left set across restarts, or
+    // simply still set out of caution) must fall through to the ordinary
+    // Node::recover path below instead, since its real snapshot/log by now
+    // carries the actual membership -- Node::recover already knows to
+    // prefer that over anything this env var could say.
+    let is_fresh_storage = storage.hard_state() == HardState::default()
+        && storage.log().is_empty()
+        && storage.snapshot().last_included_index == 0;
+
+    let node = if join_as_learner && is_fresh_storage {
+        Node::new_learner(id, election_timeout_ticks, heartbeat_interval_ticks)
+            .expect("valid node configuration")
+    } else {
+        // member_ids (from KUROGANE_PEERS) still matters here even in join
+        // mode that fell through to this branch on a restart: recover only
+        // ever *falls back* to wrapping it as the bootstrap (C_0) config
+        // when there's truly no prior snapshot at all, which can't be true
+        // once is_fresh_storage was false.
+        //
+        // Deliberate simplification for a genesis (non-join) node too: this
+        // is a learning project's dev/test binary, not a deployed service
+        // (see the module doc comment), so KUROGANE_PEERS is still required
+        // even when joining -- it's just repurposed. A join-mode node's
+        // *membership* comes entirely from Node::new_learner's empty config
+        // and later real AddLearner/ProposeConfigChange traffic, never from
+        // this list; KUROGANE_PEERS here only ever seeds peer_addresses/
+        // GrpcPeerTransport below (so this node knows how to reach the rest
+        // of the cluster, and how the rest of the cluster's own
+        // KUROGANE_PEERS entry for this node's id resolves its own listen
+        // address) -- reachability, not membership.
+        Node::recover(
+            id,
+            member_ids,
+            election_timeout_ticks,
+            heartbeat_interval_ticks,
+            storage.hard_state(),
+            storage.log().to_vec(),
+            Snapshot {
+                metadata: storage.snapshot(),
+                data: storage.snapshot_data().to_vec(),
+                config: storage.snapshot_config().clone(),
+            },
+            storage.learners().to_vec(),
+        )
+        .expect("valid node configuration")
+    };
 
     let (handle, receiver) = actor::channel(64);
 
