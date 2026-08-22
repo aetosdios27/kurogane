@@ -289,10 +289,23 @@ impl Harness {
     }
 
     /// Submits `command` against `target` on behalf of `client`, mirroring
-    /// `kurogane-runtime`'s real blocking `Propose` RPC: resolves
-    /// immediately with `Rejected` if `target` isn't reachable (crashed)
-    /// or isn't the leader, otherwise resolves later (via `step`) once the
-    /// assigned index applies or `apply_timeout_ticks` elapses.
+    /// `kurogane-runtime`'s real blocking `Propose` RPC: resolves later
+    /// (via `step`) once the assigned index applies or
+    /// `apply_timeout_ticks` elapses, or immediately with `Rejected` if
+    /// `target` isn't the leader (`Node::propose` returns `None`, nothing
+    /// was ever appended) or is currently crashed.
+    ///
+    /// The crashed case is `Rejected`, not `Indeterminate`, ONLY because
+    /// this `Harness` never lets a proposal reach a down replica in the
+    /// first place -- `target` is missing from `self.replicas` before
+    /// `propose` is ever called, so nothing was appended here either. That
+    /// is a narrower, harness-specific fact than "the target was
+    /// unreachable," and it would not hold for a generator that could
+    /// crash a process *mid*-RPC (a real client mid-connection, say) --
+    /// that case is genuinely ambiguous (the command might have reached
+    /// the process and been appended before the crash) and belongs under
+    /// `Indeterminate`. Don't reuse this branch's `Rejected` outcome as a
+    /// template for "target unreachable" in general.
     pub fn submit(&mut self, client: ClientId, target: NodeId, command: Command) {
         let Some(replica) = self.replicas.get_mut(&target) else {
             self.history.push(HistoryEntry {
