@@ -212,6 +212,15 @@ impl Harness {
             .map(|(&id, _)| id)
     }
 
+    /// Reads `id`'s own `Replica` directly without going through a client
+    /// operation -- e.g. to confirm an isolated/restarted node's actual
+    /// applied state independent of whatever it would itself report if
+    /// asked (which, for anything but the leader, would just be a
+    /// `Rejected` redirect). `None` if `id` is currently down.
+    pub fn replica(&self, id: NodeId) -> Option<&Replica> {
+        self.replicas.get(&id)
+    }
+
     /// Partitions `id` from every other node: messages to or from it are
     /// dropped, never delayed-and-delivered, matching a real network
     /// partition rather than a slow link.
@@ -1093,6 +1102,52 @@ mod tests {
         assert_eq!(harness.history().len(), 1);
         assert_eq!(harness.history()[0].outcome, Outcome::Rejected);
         assert_eq!(harness.history()[0].return_tick, Some(0));
+    }
+
+    #[test]
+    fn an_isolated_follower_falls_behind_and_catches_up_once_healed() {
+        let peers = vec![NodeId(1), NodeId(2), NodeId(3)];
+        let mut harness = Harness::new(peers.clone(), 5, 2, 5, 5, 10, 1, 1, 60);
+
+        let mut leader = None;
+        for _ in 0..60 {
+            harness.step();
+            if leader.is_none() {
+                leader = harness.current_leader();
+            }
+        }
+        let leader = leader.expect("cluster elects a leader within 60 ticks");
+        let follower = *peers.iter().find(|&&id| id != leader).unwrap();
+
+        harness.isolate(follower);
+        harness.submit(ClientId(0), leader, set(b"k", b"v1"));
+        for _ in 0..15 {
+            harness.step();
+        }
+
+        let write = harness
+            .history()
+            .iter()
+            .find(|entry| entry.client == ClientId(0))
+            .expect("the write resolves despite the partition -- 2 of 3 is still a majority");
+        assert!(matches!(write.outcome, Outcome::Applied(_)));
+
+        assert_eq!(
+            harness.replica(follower).unwrap().state_machine().get(b"k"),
+            None,
+            "the isolated follower must not have received the write -- proves isolation actually drops messages, not just that this run happened to succeed anyway"
+        );
+
+        harness.heal(follower);
+        for _ in 0..15 {
+            harness.step();
+        }
+
+        assert_eq!(
+            harness.replica(follower).unwrap().state_machine().get(b"k"),
+            Some(b"v1".as_slice()),
+            "the healed follower must have caught up on the write it missed while isolated"
+        );
     }
 
     // --- Checker: fixtures it must accept ----------------------------
