@@ -425,6 +425,7 @@ dependencies = [
  "kurogane-kv",
  "kurogane-raft",
  "kurogane-sim",
+ "tempfile",
 ]
 
 [[package]]

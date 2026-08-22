@@ -1,7 +1,11 @@
 //! A deterministic-but-fault-injecting harness over real `kurogane-kv`
 //! `Replica`s, plus a hand-rolled linearizability checker over the
-//! client-visible histories it (or a real `kurogane-runtime` cluster,
-//! sharing the exact same three-state outcome shape) produces.
+//! client-visible histories it produces. `Outcome`'s three states were
+//! deliberately designed to mirror `kurogane-runtime`'s real `ProposeReply`
+//! shape exactly, so a future real-process history generator could reuse
+//! `is_linearizable` unchanged -- but no such generator exists yet; today
+//! this checker only ever sees histories this crate's own `Harness`
+//! produced.
 //!
 //! Lives in its own crate rather than inside `kurogane-sim` because
 //! `kurogane-sim`'s `Cluster`/`Simulation` are deliberately scoped to raw
@@ -62,6 +66,27 @@ pub struct HistoryEntry {
     pub outcome: Outcome,
 }
 
+/// One kind of fault-injection event `Harness` can record -- see
+/// `Harness::faults`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FaultKind {
+    Isolated,
+    Healed,
+    Crashed,
+    Restarted,
+}
+
+/// One fault-injection event that actually changed something, tick-stamped
+/// by the harness's own logical clock -- the retained record a run's gate
+/// evidence points at, matching `decisions.md`'s "retain the seed and
+/// complete event history" convention.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FaultEvent {
+    pub tick: u64,
+    pub node: NodeId,
+    pub kind: FaultKind,
+}
+
 /// One client operation the harness is still waiting on.
 struct PendingOp {
     client: ClientId,
@@ -107,6 +132,7 @@ pub struct Harness {
     trace: Vec<TraceEvent>,
     pending: Vec<PendingOp>,
     history: Vec<HistoryEntry>,
+    faults: Vec<FaultEvent>,
 }
 
 impl Harness {
@@ -152,6 +178,7 @@ impl Harness {
             trace: Vec::new(),
             pending: Vec::new(),
             history: Vec::new(),
+            faults: Vec::new(),
         }
     }
 
@@ -165,6 +192,13 @@ impl Harness {
 
     pub fn history(&self) -> &[HistoryEntry] {
         &self.history
+    }
+
+    /// Every fault-injection event that actually changed something, in the
+    /// order it happened -- the replay artifact for whatever run produced
+    /// this harness's history.
+    pub fn faults(&self) -> &[FaultEvent] {
+        &self.faults
     }
 
     /// Any node currently in `Role::Leader` -- best-effort, exactly like a
@@ -182,11 +216,15 @@ impl Harness {
     /// dropped, never delayed-and-delivered, matching a real network
     /// partition rather than a slow link.
     pub fn isolate(&mut self, id: NodeId) {
-        self.isolated.insert(id);
+        if self.isolated.insert(id) {
+            self.record_fault(id, FaultKind::Isolated);
+        }
     }
 
     pub fn heal(&mut self, id: NodeId) {
-        self.isolated.remove(&id);
+        if self.isolated.remove(&id) {
+            self.record_fault(id, FaultKind::Healed);
+        }
     }
 
     pub fn is_isolated(&self, id: NodeId) -> bool {
@@ -199,7 +237,9 @@ impl Harness {
     /// contract `kurogane_sim::Cluster::replace_node` proves at the raw
     /// `Node` level. A no-op if `id` is already down.
     pub fn crash(&mut self, id: NodeId) {
-        self.replicas.remove(&id);
+        if self.replicas.remove(&id).is_some() {
+            self.record_fault(id, FaultKind::Crashed);
+        }
     }
 
     /// Reconstructs `id` from its `DurableState` and reinserts it as a
@@ -228,6 +268,15 @@ impl Harness {
         )
         .expect("a node's own durable state always reconstructs validly");
         self.replicas.insert(id, Replica::recover(node));
+        self.record_fault(id, FaultKind::Restarted);
+    }
+
+    fn record_fault(&mut self, node: NodeId, kind: FaultKind) {
+        self.faults.push(FaultEvent {
+            tick: self.clock,
+            node,
+            kind,
+        });
     }
 
     /// Submits `command` against `target` on behalf of `client`, mirroring
@@ -447,7 +496,7 @@ pub struct RunConfig {
 /// than just interleaving. Uses a second `Rng` stream (derived from, but
 /// distinct from, `seed`) for client/fault scheduling decisions, so those
 /// choices never perturb the harness's own message-delay/timeout draws.
-pub fn run(seed: u64, config: &RunConfig) -> (Vec<TraceEvent>, Vec<HistoryEntry>) {
+pub fn run(seed: u64, config: &RunConfig) -> (Vec<TraceEvent>, Vec<HistoryEntry>, Vec<FaultEvent>) {
     let mut harness = Harness::new(
         config.peers.clone(),
         config.election_timeout,
@@ -496,8 +545,9 @@ pub fn run(seed: u64, config: &RunConfig) -> (Vec<TraceEvent>, Vec<HistoryEntry>
     }
 
     let trace = harness.trace().to_vec();
+    let faults = harness.faults().to_vec();
     let history = harness.finish();
-    (trace, history)
+    (trace, history, faults)
 }
 
 fn random_command(rng: &mut Rng, unique: u64) -> Command {
@@ -620,13 +670,18 @@ struct Op {
 /// confirmation would let a checker "pass" a history that omits a real
 /// write, exactly the false confidence this exists to rule out.
 ///
-/// Known limitation, accepted for this milestone rather than solved: a
-/// real-time precedence constraint is only ever derived between two
-/// *definite* (`Applied`) operations. An `Indeterminate` operation's
-/// actual effect time is unbounded (it might apply arbitrarily later than
-/// this run ever observed), so no ordering constraint is derived to or
-/// from one -- a conservative choice that can only make the checker more
-/// permissive, never mask a real violation among definite operations.
+/// Known limitation, accepted for this milestone rather than solved: an
+/// `Indeterminate` operation is never *forced* to precede anything -- its
+/// actual effect time is unbounded above (it might apply arbitrarily later
+/// than this run ever observed), so a definite operation that returned
+/// after an `Indeterminate` one was invoked is still free to be linearized
+/// before it. It's still bounded *below* by its own invoke tick, though
+/// (nothing can take effect before it was invoked, ambiguous or not), so a
+/// definite operation that already finished before an `Indeterminate` one
+/// was even invoked still forces that ordering. This asymmetry is a
+/// conservative choice -- it can only make the checker more permissive
+/// about where an ambiguous operation could slot in, never mask a real
+/// violation among the definite operations whose ordering is fully known.
 pub fn is_linearizable(history: &[HistoryEntry]) -> bool {
     let ops: Vec<Op> = history
         .iter()
@@ -667,7 +722,17 @@ pub fn is_linearizable(history: &[HistoryEntry]) -> bool {
 }
 
 fn precedes(a: &Op, b: &Op) -> bool {
-    if a.optional || b.optional {
+    // `a`'s effect time is only known (bounded above) when it's definite --
+    // an Indeterminate `a` might take effect arbitrarily late, so it can
+    // never be forced to precede anything. `b`, on the other hand, is
+    // bounded *below* by its own invoke tick regardless of whether it's
+    // definite or ambiguous: no operation, Indeterminate or not, can have
+    // taken effect before it was ever invoked. Dropping that lower bound
+    // for an Indeterminate `b` would let it be linearized earlier than
+    // physically possible -- e.g. before a definite op that already
+    // returned a value only this one could have produced -- which is
+    // exactly the false-accept this checker exists to catch.
+    if a.optional {
         return false;
     }
     match a.finish {
@@ -786,22 +851,39 @@ mod tests {
     // --- Harness-level behavior -------------------------------------
 
     #[test]
+    fn a_saved_seed_reproduces_the_exact_same_run_after_loading() {
+        let peers = vec![NodeId(1), NodeId(2), NodeId(3)];
+        let original_config = config(peers);
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("seed.txt");
+
+        save_seed(99, &original_config, &path).expect("save seed");
+        let (loaded_seed, loaded_config) = load_seed(&path).expect("load seed");
+
+        assert_eq!(loaded_seed, 99);
+        let (_, original_history, _) = run(99, &original_config);
+        let (_, loaded_history, _) = run(loaded_seed, &loaded_config);
+        assert_eq!(original_history, loaded_history);
+    }
+
+    #[test]
     fn same_seed_and_config_reproduces_an_identical_history() {
         let peers = vec![NodeId(1), NodeId(2), NodeId(3)];
         let config = config(peers);
 
-        let (trace_a, history_a) = run(42, &config);
-        let (trace_b, history_b) = run(42, &config);
+        let (trace_a, history_a, faults_a) = run(42, &config);
+        let (trace_b, history_b, faults_b) = run(42, &config);
 
         assert_eq!(trace_a, trace_b);
         assert_eq!(history_a, history_b);
+        assert_eq!(faults_a, faults_b);
     }
 
     #[test]
     fn a_run_produces_genuinely_concurrent_operations() {
         let peers = vec![NodeId(1), NodeId(2), NodeId(3)];
         let config = config(peers);
-        let (_, history) = run(7, &config);
+        let (_, history, _) = run(7, &config);
 
         assert!(
             !history.is_empty(),
@@ -824,6 +906,88 @@ mod tests {
             overlaps,
             "expected at least one pair of overlapping operations from different clients"
         );
+    }
+
+    #[test]
+    fn a_seeded_run_with_a_fault_mid_flight_produces_a_linearizable_history() {
+        // The literal roadmap gate: a concrete seeded run whose history
+        // includes at least one fault-injection event with an operation
+        // genuinely outstanding across it, and the result is linearizable.
+        // The fault is forced deterministically rather than left to dice
+        // -- a probabilistic assertion that some interleaving occurred is
+        // a flaky test waiting to happen.
+        let peers = vec![NodeId(1), NodeId(2), NodeId(3)];
+        // A fixed (non-randomized) timeout would make every node time out
+        // on the same tick, forever splitting the vote three ways -- a
+        // real min/max spread is what lets one candidate actually pull
+        // ahead, same as any real cluster's jittered election timeout.
+        let mut harness = Harness::new(peers.clone(), 5, 2, 123, 5, 10, 1, 1, 60);
+
+        let mut leader = None;
+        for _ in 0..60 {
+            harness.step();
+            if leader.is_none() {
+                leader = harness.current_leader();
+            }
+        }
+        let leader = leader.expect("cluster elects a leader within 60 ticks");
+        let follower = *peers.iter().find(|&&id| id != leader).unwrap();
+
+        harness.submit(ClientId(0), leader, set(b"k", b"v1"));
+        assert!(
+            harness.history().is_empty(),
+            "the write must still be outstanding when the fault lands"
+        );
+
+        harness.crash(follower);
+        let fault_tick = harness.faults()[0].tick;
+
+        for _ in 0..20 {
+            harness.step();
+        }
+        harness.restart(follower);
+        for _ in 0..15 {
+            harness.step();
+        }
+        harness.submit(ClientId(1), leader, get(b"k"));
+        for _ in 0..10 {
+            harness.step();
+        }
+
+        let faults = harness.faults().to_vec();
+        let history = harness.finish();
+
+        assert_eq!(
+            faults.len(),
+            2,
+            "expected exactly the forced crash and restart"
+        );
+        assert_eq!(faults[0].kind, FaultKind::Crashed);
+        assert_eq!(faults[1].kind, FaultKind::Restarted);
+
+        let write = history
+            .iter()
+            .find(|entry| entry.client == ClientId(0))
+            .expect("the write is present in the final history");
+        assert!(
+            write.invoke_tick <= fault_tick
+                && write.return_tick.expect("the write eventually resolves") > fault_tick,
+            "the write's own invoke/return window must span the fault tick"
+        );
+        assert!(matches!(write.outcome, Outcome::Applied(_)));
+
+        let read = history
+            .iter()
+            .find(|entry| entry.client == ClientId(1))
+            .expect("the read is present in the final history");
+        assert_eq!(
+            read.outcome,
+            Outcome::Applied(ApplyResult::Get {
+                value: Some(b"v1".to_vec())
+            })
+        );
+
+        assert!(is_linearizable(&history));
     }
 
     #[test]
@@ -1003,6 +1167,35 @@ mod tests {
     // --- Checker: fixtures it must reject ----------------------------
 
     #[test]
+    fn rejects_a_get_observing_an_indeterminate_write_invoked_after_the_get_already_returned() {
+        // An Indeterminate op's effect time is unbounded *above* -- it
+        // might apply arbitrarily late -- but never below its own invoke
+        // tick. A Get that already returned v1 at tick 15 cannot possibly
+        // be explained by a write not even invoked until tick 100:
+        // regression test for the `precedes` bug where the lower bound was
+        // dropped entirely for an Indeterminate right-hand side.
+        let history = vec![
+            applied_entry(
+                0,
+                10,
+                15,
+                get(b"k"),
+                ApplyResult::Get {
+                    value: Some(b"v1".to_vec()),
+                },
+            ),
+            HistoryEntry {
+                client: ClientId(1),
+                invoke_tick: 100,
+                return_tick: Some(160),
+                command: set(b"k", b"v1"),
+                outcome: Outcome::Indeterminate,
+            },
+        ];
+        assert!(!is_linearizable(&history));
+    }
+
+    #[test]
     fn rejects_a_get_returning_a_value_that_was_never_set() {
         let history = vec![applied_entry(
             0,
@@ -1088,7 +1281,7 @@ mod tests {
         for seed in 0..5 {
             let peers = vec![NodeId(1), NodeId(2), NodeId(3)];
             let config = config(peers);
-            let (_, history) = run(seed, &config);
+            let (_, history, _) = run(seed, &config);
             assert!(
                 is_linearizable(&history),
                 "seed {seed} produced a history the checker rejected"

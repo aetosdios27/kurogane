@@ -10,5 +10,8 @@ kurogane-raft = { path = "../kurogane-raft" }
 kurogane-kv = { path = "../kurogane-kv" }
 kurogane-sim = { path = "../kurogane-sim" }
 
+[dev-dependencies]
+tempfile = "3.27.0"
+
 [lints]
 workspace = true
