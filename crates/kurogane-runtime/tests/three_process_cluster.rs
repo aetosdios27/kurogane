@@ -14,7 +14,11 @@
 //! killing the leader that accepted a learner's AddLearner between
 //! registration and promotion actually forces
 //! add_learner_wait_catch_up_and_promote's re-registration retry to run
-//! against a different leader, not just look correct by construction.
+//! against a different leader, not just look correct by construction; and
+//! (separately) a join-mode process that is never admitted via a real
+//! AddLearner call never calls a real election, at the level of the actual
+//! compiled binary's own wall-clock tick loop, not just kurogane-raft's
+//! unit-level vouching for Node::new_learner in isolation.
 
 use std::collections::BTreeMap;
 use std::net::TcpListener;
@@ -22,7 +26,7 @@ use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 use kurogane_kv::{Command as KvCommand, StateMachine};
-use kurogane_raft::LogPayload;
+use kurogane_raft::{HardState, LogPayload};
 use kurogane_runtime::proto::raft_client_client::RaftClientClient;
 use kurogane_runtime::proto::{
     AddLearnerRequest, Command as ProtoCommand, ProposeConfigChangeRequest, ProposeRequest,
@@ -1042,4 +1046,60 @@ async fn add_learner_promotion_retries_after_the_registering_leader_is_killed() 
         );
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
+}
+
+/// `Node::new_learner`'s "never self-elects" property is already proven at
+/// the `kurogane-raft` unit level (`new_learner_never_self_elects_even_after_
+/// many_ticks`), but that only vouches for the core state-machine logic in
+/// isolation. This proves the real compiled binary's own wiring inherits the
+/// property: a join-mode process, spawned on genuinely fresh storage and
+/// never admitted to anything (no `AddLearner` call is ever made against
+/// it), left running under its own real wall-clock tick loop for well past
+/// several election-timeout multiples, must never have called
+/// `start_election` -- checked the only way observable from outside the
+/// process, by reading its own persisted `HardState` directly and confirming
+/// neither `current_term` nor `voted_for` ever moved off their fresh-node
+/// defaults.
+#[tokio::test]
+async fn a_join_mode_process_never_self_elects_without_being_admitted() {
+    let id = 4u64;
+    let peer_port = free_port();
+    let client_port = free_port();
+    let peers = format!("{id}=127.0.0.1:{peer_port}");
+    let client_addr = format!("127.0.0.1:{client_port}");
+
+    let dir = tempfile::tempdir().expect("temp dir");
+    let storage_path = dir.path().join("state");
+
+    let mut guard = ProcessGuard(vec![spawn_node(
+        id,
+        &peers,
+        &client_addr,
+        &storage_path,
+        NO_COMPACTION,
+        true,
+    )]);
+
+    // ELECTION_TIMEOUT_TICKS=5 * TICK_INTERVAL_MS=50 = a 250ms election
+    // timeout; a normally-bootstrapped single-node cluster would certainly
+    // have elected itself well inside that window (spawn_server's own
+    // helper elsewhere in this test suite only waits 20ms after one tick).
+    // 3 seconds is well past ten such multiples.
+    tokio::time::sleep(Duration::from_secs(3)).await;
+
+    let hard_state = Storage::open(&storage_path)
+        .expect("reopen the join-mode process's storage")
+        .hard_state();
+    assert_eq!(
+        hard_state,
+        HardState::default(),
+        "a join-mode process that was never admitted via a real AddLearner call must never \
+         have started an election -- current_term/voted_for should still be exactly the fresh \
+         defaults Node::new_learner starts with"
+    );
+
+    // Kill it explicitly (rather than only relying on ProcessGuard's Drop)
+    // so the assertion above is checked before any teardown races it.
+    guard.0[0].kill().expect("kill the join-mode process");
+    guard.0[0].wait().expect("reap killed process");
 }
