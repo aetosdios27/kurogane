@@ -1,6 +1,8 @@
 //! The `RaftPeer` gRPC service: turns incoming peer RPCs into `Event`s fed
 //! to the actor, and turns its reply back into the RPC response.
 
+use std::time::Duration;
+
 use tonic::{Request, Response, Status};
 
 use crate::actor::{ActorHandle, AddLearnerOutcome, ProposeOutcome};
@@ -9,12 +11,35 @@ use crate::proto::raft_client_server::RaftClient;
 use crate::proto::raft_peer_server::RaftPeer;
 use crate::proto::{
     AddLearnerAccepted, AddLearnerReply, AddLearnerRequest, AppendEntriesReply,
-    AppendEntriesRequest, InstallSnapshotReply, InstallSnapshotRequest, NotLeader, ProposeAccepted,
+    AppendEntriesRequest, InstallSnapshotReply, InstallSnapshotRequest, NotLeader, ProposeApplied,
     ProposeConfigChangeAccepted, ProposeConfigChangeReply, ProposeConfigChangeRequest,
-    ProposeReply, ProposeRequest, RequestVoteReply, RequestVoteRequest, add_learner_reply,
-    propose_config_change_reply, propose_reply,
+    ProposeIndeterminate, ProposeReply, ProposeRequest, RequestVoteReply, RequestVoteRequest,
+    add_learner_reply, propose_config_change_reply, propose_reply,
 };
 use kurogane_raft::Message;
+
+/// How long `Propose` blocks waiting for its assigned index to apply on
+/// this node before giving up and reporting `Indeterminate`. Generous
+/// relative to `kurogane-node`'s own defaults (a 50ms tick interval, up to
+/// a 20-tick/1s election timeout) — this is a liveness bound on one RPC
+/// call, not a correctness-sensitive value, so it errs wide rather than
+/// tight.
+const PROPOSE_APPLY_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Blocks until `watch` reports `index` (or higher) applied, or the actor
+/// task is gone. Returns whether it actually applied — `false` only means
+/// the watch channel closed, since the caller wraps this in its own
+/// `tokio::time::timeout` for the "still running but too slow" case.
+async fn wait_for_applied(mut watch: tokio::sync::watch::Receiver<u64>, index: u64) -> bool {
+    loop {
+        if *watch.borrow() >= index {
+            return true;
+        }
+        if watch.changed().await.is_err() {
+            return false;
+        }
+    }
+}
 
 pub struct RaftPeerService {
     actor: ActorHandle,
@@ -131,13 +156,39 @@ impl RaftClient for RaftClientService {
             .await
             .ok_or_else(|| Status::unavailable("actor task is not running"))?;
 
-        let result = match outcome {
-            ProposeOutcome::Accepted(index) => {
-                propose_reply::Result::Accepted(ProposeAccepted { index })
+        let index = match outcome {
+            ProposeOutcome::Accepted(index) => index,
+            ProposeOutcome::NotLeader(hint) => {
+                return Ok(Response::new(ProposeReply {
+                    result: Some(propose_reply::Result::NotLeader(NotLeader {
+                        leader_id: hint.map(|id| id.0),
+                    })),
+                }));
             }
-            ProposeOutcome::NotLeader(hint) => propose_reply::Result::NotLeader(NotLeader {
-                leader_id: hint.map(|id| id.0),
-            }),
+        };
+
+        let result = match tokio::time::timeout(
+            PROPOSE_APPLY_TIMEOUT,
+            wait_for_applied(self.actor.applied_watch(), index),
+        )
+        .await
+        {
+            Ok(true) => match self.actor.applied_result(index).await.flatten() {
+                Some(applied) => propose_reply::Result::Applied(ProposeApplied {
+                    index,
+                    result: Some(dto::apply_result_to_proto(applied)),
+                }),
+                // The watch fired but the result is already gone (a very
+                // active cluster pruned it via compaction between the two
+                // round trips) or the actor task is gone -- either way this
+                // caller genuinely can't confirm what happened, same as a
+                // plain timeout.
+                None => propose_reply::Result::Indeterminate(ProposeIndeterminate {}),
+            },
+            // Timed out, or the watch channel closed (actor task gone):
+            // this index may or may not ever apply -- see ProposeReply's
+            // doc comment on Indeterminate in the .proto file.
+            _ => propose_reply::Result::Indeterminate(ProposeIndeterminate {}),
         };
         Ok(Response::new(ProposeReply {
             result: Some(result),

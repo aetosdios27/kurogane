@@ -117,7 +117,7 @@ async fn propose_via_any(
                 continue;
             };
             match reply.into_inner().result {
-                Some(propose_reply::Result::Accepted(accepted)) => return (id, accepted.index),
+                Some(propose_reply::Result::Applied(applied)) => return (id, applied.index),
                 Some(propose_reply::Result::NotLeader(not_leader)) => {
                     // A hint may point at a node that isn't a candidate for
                     // this call (e.g. a leader we've since killed, whose
@@ -131,6 +131,10 @@ async fn propose_via_any(
                         }
                     }
                 }
+                // A slow/uncertain apply on an otherwise-healthy leader --
+                // this helper only cares about a definite outcome, so treat
+                // it the same as no reply at all and retry.
+                Some(propose_reply::Result::Indeterminate(_)) => {}
                 None => {}
             }
         }

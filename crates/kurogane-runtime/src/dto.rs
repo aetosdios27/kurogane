@@ -5,7 +5,7 @@
 use std::error::Error;
 use std::fmt;
 
-use kurogane_kv::Command;
+use kurogane_kv::{ApplyResult, Command};
 use kurogane_raft::{
     AppendEntries, AppendEntriesResponse, ClusterConfig, InstallSnapshot, InstallSnapshotResponse,
     LogEntry, LogPayload, NodeId, RequestVote, RequestVoteResponse,
@@ -264,6 +264,46 @@ pub fn command_to_proto(value: Command) -> proto::Command {
     proto::Command { kind: Some(kind) }
 }
 
+/// An `ApplyResult` message with no `kind` set — malformed input, since
+/// every legitimate caller sets exactly one.
+#[derive(Debug)]
+pub struct MissingApplyResultKind;
+
+impl fmt::Display for MissingApplyResultKind {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("ApplyResult message is missing its kind")
+    }
+}
+
+impl Error for MissingApplyResultKind {}
+
+pub fn apply_result_from_proto(
+    proto: proto::ApplyResult,
+) -> Result<ApplyResult, MissingApplyResultKind> {
+    match proto.kind.ok_or(MissingApplyResultKind)? {
+        proto::apply_result::Kind::Set(set) => Ok(ApplyResult::Set {
+            previous: set.previous,
+        }),
+        proto::apply_result::Kind::Delete(delete) => Ok(ApplyResult::Delete {
+            previous: delete.previous,
+        }),
+        proto::apply_result::Kind::Get(get) => Ok(ApplyResult::Get { value: get.value }),
+    }
+}
+
+pub fn apply_result_to_proto(value: ApplyResult) -> proto::ApplyResult {
+    let kind = match value {
+        ApplyResult::Set { previous } => {
+            proto::apply_result::Kind::Set(proto::SetResult { previous })
+        }
+        ApplyResult::Delete { previous } => {
+            proto::apply_result::Kind::Delete(proto::DeleteResult { previous })
+        }
+        ApplyResult::Get { value } => proto::apply_result::Kind::Get(proto::GetResult { value }),
+    };
+    proto::ApplyResult { kind: Some(kind) }
+}
+
 #[cfg(test)]
 mod tests {
     use kurogane_kv::Command;
@@ -410,6 +450,47 @@ mod tests {
         let proto = proto::Command { kind: None };
 
         assert!(command_from_proto(proto).is_err());
+    }
+
+    #[test]
+    fn round_trips_a_set_apply_result() {
+        let value = ApplyResult::Set {
+            previous: Some(vec![1, 2]),
+        };
+
+        assert_eq!(
+            apply_result_from_proto(apply_result_to_proto(value.clone())).expect("valid result"),
+            value
+        );
+    }
+
+    #[test]
+    fn round_trips_a_delete_apply_result_with_no_previous_value() {
+        let value = ApplyResult::Delete { previous: None };
+
+        assert_eq!(
+            apply_result_from_proto(apply_result_to_proto(value.clone())).expect("valid result"),
+            value
+        );
+    }
+
+    #[test]
+    fn round_trips_a_get_apply_result() {
+        let value = ApplyResult::Get {
+            value: Some(vec![9]),
+        };
+
+        assert_eq!(
+            apply_result_from_proto(apply_result_to_proto(value.clone())).expect("valid result"),
+            value
+        );
+    }
+
+    #[test]
+    fn rejects_an_apply_result_with_no_kind_set() {
+        let proto = proto::ApplyResult { kind: None };
+
+        assert!(apply_result_from_proto(proto).is_err());
     }
 
     #[test]

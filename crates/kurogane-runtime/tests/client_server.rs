@@ -1,16 +1,16 @@
 //! Proves the client gRPC server actually works over a real socket:
 //! `RaftClientService`'s `Propose` handler wired to a real actor, both the
-//! accepted and not-leader/redirect paths.
+//! applied and not-leader/redirect paths.
 
 use std::net::SocketAddr;
 
 use kurogane_kv::Replica;
 use kurogane_raft::{Message, Node, NodeId};
 use kurogane_runtime::actor::{self, Actor, PeerTransport};
-use kurogane_runtime::proto::propose_reply;
 use kurogane_runtime::proto::raft_client_client::RaftClientClient;
 use kurogane_runtime::proto::raft_client_server::RaftClientServer;
-use kurogane_runtime::proto::{Command, GetCommand, ProposeRequest};
+use kurogane_runtime::proto::{Command, GetCommand, ProposeRequest, SetCommand};
+use kurogane_runtime::proto::{apply_result, propose_reply};
 use kurogane_runtime::server::RaftClientService;
 use kurogane_runtime::storage::Storage;
 use tempfile::tempdir;
@@ -81,10 +81,77 @@ async fn a_propose_on_the_leader_round_trips_over_a_real_socket() {
         .into_inner();
 
     match reply.result {
-        Some(propose_reply::Result::Accepted(accepted)) => {
-            assert_eq!(accepted.index, 1);
+        Some(propose_reply::Result::Applied(applied)) => {
+            assert_eq!(applied.index, 1);
+            let result = applied.result.expect("applied result present");
+            match result.kind {
+                Some(apply_result::Kind::Get(get)) => assert_eq!(get.value, None),
+                other => panic!("expected a Get apply result, got {other:?}"),
+            }
         }
-        other => panic!("expected an accepted propose, got {other:?}"),
+        other => panic!("expected an applied propose, got {other:?}"),
+    }
+}
+
+/// The point of blocking `Propose` until its index applies: a client
+/// actually gets the value it wrote back, and a later `Get` for the same
+/// key sees it -- not just an index the client has to trust landed
+/// somewhere.
+#[tokio::test]
+async fn a_propose_returns_the_applied_value_and_a_later_get_observes_it() {
+    let addr = spawn_server(NodeId(1), vec![NodeId(1)]).await;
+
+    let mut client = RaftClientClient::connect(format!("http://{addr}"))
+        .await
+        .expect("connect to the real listener");
+
+    let set_reply = client
+        .propose(Request::new(ProposeRequest {
+            command: Some(Command {
+                kind: Some(kurogane_runtime::proto::command::Kind::Set(SetCommand {
+                    key: b"k".to_vec(),
+                    value: b"v".to_vec(),
+                })),
+            }),
+        }))
+        .await
+        .expect("real RPC succeeds")
+        .into_inner();
+
+    match set_reply.result {
+        Some(propose_reply::Result::Applied(applied)) => {
+            let result = applied.result.expect("applied result present");
+            match result.kind {
+                Some(apply_result::Kind::Set(set)) => assert_eq!(set.previous, None),
+                other => panic!("expected a Set apply result, got {other:?}"),
+            }
+        }
+        other => panic!("expected an applied propose, got {other:?}"),
+    }
+
+    let get_reply = client
+        .propose(Request::new(ProposeRequest {
+            command: Some(Command {
+                kind: Some(kurogane_runtime::proto::command::Kind::Get(GetCommand {
+                    key: b"k".to_vec(),
+                })),
+            }),
+        }))
+        .await
+        .expect("real RPC succeeds")
+        .into_inner();
+
+    match get_reply.result {
+        Some(propose_reply::Result::Applied(applied)) => {
+            let result = applied.result.expect("applied result present");
+            match result.kind {
+                Some(apply_result::Kind::Get(get)) => {
+                    assert_eq!(get.value, Some(b"v".to_vec()))
+                }
+                other => panic!("expected a Get apply result, got {other:?}"),
+            }
+        }
+        other => panic!("expected an applied propose, got {other:?}"),
     }
 }
 

@@ -304,6 +304,14 @@ enum ActorRequest {
         id: NodeId,
         reply: tokio::sync::oneshot::Sender<()>,
     },
+    /// Fetches a cloned `ApplyResult` for an already-applied index. Used by
+    /// a caller that's separately confirmed (via `ActorHandle::applied_watch`)
+    /// that `index` has applied — `None` means it hasn't (yet, or its
+    /// result was already pruned by compaction), not that it never will.
+    AppliedResult {
+        index: u64,
+        reply: tokio::sync::oneshot::Sender<Option<ApplyResult>>,
+    },
 }
 
 /// A cheaply cloneable way to submit work to an actor running in its own
@@ -313,6 +321,11 @@ enum ActorRequest {
 #[derive(Clone)]
 pub struct ActorHandle {
     sender: tokio::sync::mpsc::Sender<ActorRequest>,
+    /// The actor's own last-applied index, updated by `run` after every
+    /// request it processes. A caller that just got `ProposeOutcome::Accepted`
+    /// awaits this reaching that index rather than polling — see `server.rs`'s
+    /// `propose` handler, the reason this exists.
+    applied: tokio::sync::watch::Receiver<u64>,
 }
 
 impl ActorHandle {
@@ -396,19 +409,52 @@ impl ActorHandle {
             .ok()?;
         receiver.await.ok()
     }
+
+    /// A cloneable watch over the actor's own last-applied index. A caller
+    /// waits for this to reach a target index (via `changed()`) rather than
+    /// polling — cheap even for a caller waiting on many outstanding
+    /// indices concurrently, since each clone is independent.
+    pub fn applied_watch(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.applied.clone()
+    }
+
+    /// Fetches a cloned `ApplyResult` for `index`. Only meaningful after
+    /// `applied_watch` has confirmed `index` applied — see that method's
+    /// doc comment. `None` (outer) means the actor task is gone; `None`
+    /// (inner) means the result isn't available (not yet applied, or
+    /// pruned by compaction since).
+    pub async fn applied_result(&self, index: u64) -> Option<Option<ApplyResult>> {
+        let (reply, receiver) = tokio::sync::oneshot::channel();
+        self.sender
+            .send(ActorRequest::AppliedResult { index, reply })
+            .await
+            .ok()?;
+        receiver.await.ok()
+    }
 }
 
 /// The receiving half of an actor's channel. Opaque on purpose — only
 /// `run` drains it, so `ActorRequest` itself never needs to be public.
 pub struct ActorReceiver {
     receiver: tokio::sync::mpsc::Receiver<ActorRequest>,
+    applied: tokio::sync::watch::Sender<u64>,
 }
 
 /// Creates an actor task's channel pair: the `ActorHandle` other tasks use
 /// to submit work, and the receiver `run` drains.
 pub fn channel(capacity: usize) -> (ActorHandle, ActorReceiver) {
     let (sender, receiver) = tokio::sync::mpsc::channel(capacity);
-    (ActorHandle { sender }, ActorReceiver { receiver })
+    let (applied_tx, applied_rx) = tokio::sync::watch::channel(0);
+    (
+        ActorHandle {
+            sender,
+            applied: applied_rx,
+        },
+        ActorReceiver {
+            receiver,
+            applied: applied_tx,
+        },
+    )
 }
 
 /// Runs `actor` until its channel closes, draining one request at a time —
@@ -464,7 +510,22 @@ pub async fn run<T: PeerTransport>(mut actor: Actor<T>, mut requests: ActorRecei
                     .expect("durable storage write must succeed");
                 let _ = reply.send(());
             }
+            ActorRequest::AppliedResult { index, reply } => {
+                let _ = reply.send(actor.applied_result(index).cloned());
+            }
         }
+        // Every arm above can only ever move last_applied forward (or leave
+        // it unchanged) — publish it once per processed request rather than
+        // per arm, so a watcher (server.rs's blocking `Propose` handler)
+        // never misses an advance regardless of which request caused it
+        // (an AppendEntries from a peer applies just as well as our own
+        // Propose).
+        requests.applied.send_if_modified(|current| {
+            let latest = actor.state_machine().last_applied();
+            let changed = latest != *current;
+            *current = latest;
+            changed
+        });
     }
 }
 
@@ -828,6 +889,42 @@ mod tests {
             .expect("actor task is alive");
 
         assert_eq!(outcome, ProposeOutcome::Accepted(1));
+    }
+
+    #[tokio::test]
+    async fn applied_watch_reports_an_index_once_it_actually_applies() {
+        let actor = actor(RaftNodeId(1), vec![RaftNodeId(1)], 1, 1);
+        let (handle, receiver) = channel(8);
+        tokio::spawn(run(actor, receiver));
+
+        handle.tick(5);
+
+        let mut watch = handle.applied_watch();
+        assert_eq!(*watch.borrow(), 0);
+
+        let outcome = handle
+            .propose(Command::Set {
+                key: vec![1],
+                value: vec![9],
+            })
+            .await
+            .expect("actor task is alive");
+        let ProposeOutcome::Accepted(index) = outcome else {
+            panic!("expected the single-node cluster to accept immediately");
+        };
+
+        watch
+            .changed()
+            .await
+            .expect("actor task publishes an update after applying");
+        assert_eq!(*watch.borrow(), index);
+
+        let result = handle
+            .applied_result(index)
+            .await
+            .expect("actor task is alive")
+            .expect("index has applied by the time the watch fired");
+        assert_eq!(result, ApplyResult::Set { previous: None });
     }
 
     #[test]

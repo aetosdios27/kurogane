@@ -111,16 +111,49 @@ message ProposeRequest {
   Command command = 1;
 }
 
+// `Propose` blocks server-side until its assigned index actually applies
+// (or a timeout elapses) rather than returning the bare index -- see
+// dto::apply_result_to_proto and the RaftClient service comment below for
+// why. `Indeterminate` covers both "still in flight" and "this index got
+// truncated by a conflicting leader and will never apply": both look
+// identical from the client's side (no value ever arrives), so a caller
+// must treat it as "may or may not have taken effect," never as a
+// definite failure.
 message ProposeReply {
   oneof result {
-    ProposeAccepted accepted = 1;
+    ProposeApplied applied = 1;
     NotLeader not_leader = 2;
+    ProposeIndeterminate indeterminate = 3;
   }
 }
 
-message ProposeAccepted {
+message ProposeApplied {
   uint64 index = 1;
+  ApplyResult result = 2;
 }
+
+// Mirrors kurogane_kv::ApplyResult exactly, one variant per Command kind.
+message ApplyResult {
+  oneof kind {
+    SetResult set = 1;
+    DeleteResult delete = 2;
+    GetResult get = 3;
+  }
+}
+
+message SetResult {
+  optional bytes previous = 1;
+}
+
+message DeleteResult {
+  optional bytes previous = 1;
+}
+
+message GetResult {
+  optional bytes value = 1;
+}
+
+message ProposeIndeterminate {}
 
 message NotLeader {
   // Absent when this node has no idea who the current leader is either.
