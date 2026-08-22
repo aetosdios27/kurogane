@@ -693,6 +693,28 @@ impl Node {
     pub fn step(&mut self, event: Event) -> Vec<Effect> {
         match event {
             Event::Tick { next_timeout } => self.on_tick(next_timeout),
+            // AppendEntries/InstallSnapshot deliberately do NOT go through
+            // is_member -- see that function's doc comment for why a local
+            // membership gate is wrong for exactly these two message types,
+            // unlike every other case below.
+            Event::Step {
+                from,
+                message: Message::AppendEntries(request),
+            } => {
+                if request.leader_id != from {
+                    return Vec::new();
+                }
+                self.on_append_entries(from, request)
+            }
+            Event::Step {
+                from,
+                message: Message::InstallSnapshot(request),
+            } => {
+                if request.leader_id != from {
+                    return Vec::new();
+                }
+                self.on_install_snapshot(from, request)
+            }
             Event::Step { from, message } => {
                 if !self.is_member(from) {
                     return Vec::new();
@@ -708,60 +730,62 @@ impl Node {
                     Message::RequestVoteResponse(response) => {
                         self.on_request_vote_response(from, response)
                     }
-                    Message::AppendEntries(request) => {
-                        if request.leader_id != from {
-                            return Vec::new();
-                        }
-                        self.on_append_entries(from, request)
-                    }
                     Message::AppendEntriesResponse(response) => {
                         self.on_append_entries_response(from, response)
-                    }
-                    Message::InstallSnapshot(request) => {
-                        if request.leader_id != from {
-                            return Vec::new();
-                        }
-                        self.on_install_snapshot(from, request)
                     }
                     Message::InstallSnapshotResponse(response) => {
                         self.on_install_snapshot_response(from, response)
                     }
+                    // Handled by the two arms above, before this fallback
+                    // match is ever reached.
+                    Message::AppendEntries(_) | Message::InstallSnapshot(_) => unreachable!(),
                 }
             }
         }
     }
 
     /// Whether `id` is trusted as a sender at `step()`'s message-dispatch
-    /// choke point: a voter under `current_config` (voters ∪ old_voters)
-    /// or a tracked learner. The learner half matters specifically for a
-    /// leader (or any node) receiving a message *from* a learner -- e.g.
-    /// an `AppendEntriesResponse` from a learner catching up -- without it,
-    /// that response's `from` would fail this check and get silently
-    /// dropped by `step()`, permanently stalling the learner's progress
-    /// tracking. (A learner's own incoming `AppendEntries` *from* its
-    /// leader already passes today, since the leader is always a voter --
-    /// this widening is about the reverse direction.)
+    /// choke point for `RequestVote`/`RequestVoteResponse`/
+    /// `AppendEntriesResponse`/`InstallSnapshotResponse`: a voter under
+    /// `current_config` (voters ∪ old_voters) or a tracked learner.
     ///
-    /// Third clause: a brand-new `Node::new_learner` node's own
-    /// `current_config` is genuinely empty (`voters: []`, `old_voters:
-    /// None`) -- by construction, the *only* path that ever produces that
-    /// shape, since `Node::new`/`Node::recover` both reject an empty
-    /// bootstrap set and `propose_config_change` rejects an empty
-    /// `new_voters`. Without this clause, such a node's very first contact
-    /// -- the leader's own `AddLearner`-triggered `AppendEntries`/
-    /// `InstallSnapshot` -- would itself fail this check (it's judged
-    /// against *this* node's config, not the sender's), permanently
-    /// deadlocking the join: the node can never learn who its leader is,
-    /// because it refuses to listen to anyone before it already knows. The
-    /// real trust boundary for this first contact is the runtime's shared
-    /// cluster-token authentication, not this predicate -- once a real
-    /// `AppendEntries`/`InstallSnapshot` lands and installs a real
-    /// configuration, `current_config.voters` is no longer empty and this
-    /// bypass naturally stops applying.
+    /// `AppendEntries`/`InstallSnapshot` (the *requests*, not the responses
+    /// above) deliberately bypass this check entirely, at `step()`'s own
+    /// dispatch site -- gating them on THIS node's own local
+    /// `current_config` is unsound, not merely over-cautious: a node's view
+    /// of membership can be legitimately stale (e.g. partitioned across a
+    /// membership change) while the sender is a completely legitimate,
+    /// fully-caught-up leader under the *actually current*, cluster-wide
+    /// committed configuration. If that sender isn't yet a voter/learner in
+    /// the stale receiver's own view, `is_member` would reject it --
+    /// permanently, since the very message that would correct the
+    /// receiver's stale view is the one being dropped. Unlike `RequestVote`
+    /// (where §6's disruption guard specifically needs local-membership
+    /// filtering to block a genuinely removed server from forcing
+    /// unnecessary elections), `AppendEntries`/`InstallSnapshot` don't need
+    /// it: `on_append_entries`/`on_install_snapshot`'s own term and
+    /// prev-log/log-matching checks are themselves sufficient authentication
+    /// -- a sender can't fabricate a passing prev-log check without
+    /// genuinely being a real leader that won a real election under real
+    /// quorum rules (which itself required winning votes, still gated by
+    /// this same `is_member` check on every voter it needed a vote from).
+    /// The disruption guard's own protection is therefore unaffected: a
+    /// removed server can still never *win* an election, so it can never
+    /// legitimately hold a high enough term to send a real AppendEntries/
+    /// InstallSnapshot in the first place. See
+    /// `a_follower_partitioned_across_a_membership_change_rejoins_once_healed_even_under_a_new_leader`
+    /// in `kurogane-sim` for the concrete scenario this fixes: a follower
+    /// partitioned across an entire membership change, then reached for the
+    /// first time by a brand-new leader drawn from the new membership it
+    /// never learned about.
+    ///
+    /// The learner clause matters specifically for a leader (or any node)
+    /// receiving a message *from* a learner -- e.g. an
+    /// `AppendEntriesResponse` from a learner catching up -- without it,
+    /// that response's `from` would fail this check and get silently
+    /// dropped, permanently stalling the learner's progress tracking.
     fn is_member(&self, id: NodeId) -> bool {
-        self.current_config.is_voter(id)
-            || self.learners.contains(&id)
-            || (self.current_config.voters.is_empty() && self.current_config.old_voters.is_none())
+        self.current_config.is_voter(id) || self.learners.contains(&id)
     }
 
     /// Position of absolute `index` within `log`. Callers must ensure

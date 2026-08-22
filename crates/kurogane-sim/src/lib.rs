@@ -698,9 +698,9 @@ mod simulation_tests {
     use std::collections::BTreeMap;
 
     use kurogane_raft::{
-        AppendEntries, AppendEntriesResponse, ClusterConfig, Effect, Event, InstallSnapshot,
-        InstallSnapshotResponse, LogEntry, LogPayload, Message, Node, NodeId, RequestVote,
-        RequestVoteResponse, Role, Snapshot, SnapshotMetadata,
+        AppendEntries, AppendEntriesResponse, ClusterConfig, Effect, Event, HardState,
+        InstallSnapshot, InstallSnapshotResponse, LogEntry, LogPayload, Message, Node, NodeId,
+        RequestVote, RequestVoteResponse, Role, Snapshot, SnapshotMetadata,
     };
 
     use super::{Cluster, DurableState, Simulation};
@@ -1810,6 +1810,168 @@ mod simulation_tests {
         assert_eq!(
             cluster.node(NodeId(1)).expect("known node").commit_index(),
             index
+        );
+    }
+
+    #[test]
+    fn a_follower_partitioned_across_a_membership_change_rejoins_once_healed_even_under_a_new_leader()
+     {
+        // Reproduces a suspected availability gap in is_member's local-config
+        // gate, which has no analog anywhere in the paper's Figure 2: node 3
+        // is partitioned for the entire membership change that adds node 4,
+        // so node 3's own current_config never advances past the original
+        // C_old = {1, 2, 3} -- it never sees the Configuration entries, only
+        // the nodes that stayed reachable do. If the *next* leader elected
+        // is drawn from the new membership (node 4) rather than a node 3
+        // already recognizes, node 3's own is_member(4) check (still
+        // evaluated against its own stale config) rejects every AppendEntries
+        // node 4 ever sends it -- even after the partition heals -- because
+        // step()'s dispatch drops the message before on_append_entries ever
+        // runs. Node 3 can't win an election either (its log is behind), so
+        // without a fix it is stuck outside the cluster forever, even though
+        // node 4 is a completely legitimate, fully-caught-up leader.
+        let mut cluster = Cluster::new(vec![
+            Node::new(NodeId(1), vec![NodeId(1), NodeId(2), NodeId(3)], 1, 1).expect("valid node"),
+            Node::new(NodeId(2), vec![NodeId(1), NodeId(2), NodeId(3)], 1, 1).expect("valid node"),
+            Node::new(NodeId(3), vec![NodeId(1), NodeId(2), NodeId(3)], 1, 1).expect("valid node"),
+            Node::new(
+                NodeId(4),
+                vec![NodeId(1), NodeId(2), NodeId(3), NodeId(4)],
+                1,
+                1,
+            )
+            .expect("valid node"),
+        ])
+        .expect("valid cluster");
+
+        // Node 1 wins the initial election with every real peer reachable --
+        // node 3 is a completely ordinary member up to this point.
+        let requests = cluster
+            .node_mut(NodeId(1))
+            .expect("known node")
+            .step(Event::Tick { next_timeout: 10 });
+        deliver_until_quiescent(&mut cluster, &[], NodeId(1), requests);
+        assert_eq!(
+            cluster.node(NodeId(1)).expect("known node").role(),
+            Role::Leader
+        );
+
+        // From here on, node 3 is partitioned -- every delivery in this test
+        // withholds it. It will never see the upcoming membership change.
+        let isolated = [NodeId(3)];
+
+        cluster
+            .node_mut(NodeId(1))
+            .expect("known node")
+            .add_learner(NodeId(4));
+        cluster
+            .node_mut(NodeId(1))
+            .expect("known node")
+            .propose_config_change(vec![NodeId(1), NodeId(2), NodeId(3), NodeId(4)])
+            .expect("leader accepts config change");
+
+        // Drive enough heartbeat rounds for the joint entry to commit, the
+        // automatic C_old,new -> C_new follow-up to be appended, and that
+        // follow-up to commit too -- all via node 1 and node 2 alone (a real
+        // majority of both the old {1,2,3} and new {1,2,3,4} sets without
+        // node 3: node 1+2 is 2-of-3 old, node 1+2+4 is 3-of-4 new).
+        for _ in 0..10 {
+            let heartbeat = cluster
+                .node_mut(NodeId(1))
+                .expect("known node")
+                .step(Event::Tick { next_timeout: 10 });
+            deliver_until_quiescent(&mut cluster, &isolated, NodeId(1), heartbeat);
+        }
+
+        let expected_voters = vec![NodeId(1), NodeId(2), NodeId(3), NodeId(4)];
+        for id in [NodeId(1), NodeId(2), NodeId(4)] {
+            let node = cluster.node(id).expect("known node");
+            assert_eq!(
+                node.current_config().voters,
+                expected_voters,
+                "node {id:?} should have committed the plain C_new configuration"
+            );
+            assert!(
+                node.current_config().old_voters.is_none(),
+                "node {id:?} should be past the joint phase"
+            );
+        }
+        // The whole point of this scenario: node 3, partitioned throughout,
+        // never saw any of this.
+        assert_eq!(
+            cluster
+                .node(NodeId(3))
+                .expect("known node")
+                .current_config()
+                .voters,
+            vec![NodeId(1), NodeId(2), NodeId(3)],
+            "node 3 was partitioned for the entire membership change and must still be on C_old"
+        );
+
+        // Node 1 (the original leader) now crashes and restarts -- a
+        // completely ordinary event, simulated the same way every other
+        // crash-recovery test in this file does: reconstruct a fresh
+        // Node::recover from its own persisted-equivalent state. It comes
+        // back as a plain Follower, per Node::recover's own contract.
+        let old_leader = cluster.node(NodeId(1)).expect("known node");
+        let recovered = Node::recover(
+            NodeId(1),
+            vec![NodeId(1), NodeId(2), NodeId(3)],
+            1,
+            1,
+            HardState {
+                current_term: old_leader.current_term(),
+                voted_for: None,
+            },
+            old_leader.log().to_vec(),
+            Snapshot {
+                metadata: old_leader.snapshot(),
+                data: old_leader.snapshot_data().to_vec(),
+                config: old_leader.snapshot_config().clone(),
+            },
+            old_leader.learners().iter().copied().collect(),
+        )
+        .expect("valid recovered node");
+        cluster.replace_node(recovered);
+        assert_eq!(
+            cluster.node(NodeId(1)).expect("known node").role(),
+            Role::Follower
+        );
+
+        // Node 4 campaigns. It's a real, fully-caught-up member of the
+        // committed C_new, and it only asks the peers it (correctly)
+        // recognizes -- 1, 2, and 3 -- but node 3 is still partitioned, so
+        // only 1 and 2 actually receive it.
+        let campaign = cluster
+            .node_mut(NodeId(4))
+            .expect("known node")
+            .step(Event::Tick { next_timeout: 10 });
+        deliver_until_quiescent(&mut cluster, &isolated, NodeId(4), campaign);
+        assert_eq!(
+            cluster.node(NodeId(4)).expect("known node").role(),
+            Role::Leader,
+            "node 4 should win with votes from 1, 2, and itself -- a real majority of C_new \
+             that doesn't need node 3 at all"
+        );
+
+        // Heal the partition and let node 4, the new (and entirely
+        // legitimate) leader, reach node 3 for the first time since it fell
+        // behind.
+        let heartbeat = cluster
+            .node_mut(NodeId(4))
+            .expect("known node")
+            .step(Event::Tick { next_timeout: 10 });
+        deliver_until_quiescent(&mut cluster, &[], NodeId(4), heartbeat);
+
+        assert_eq!(
+            cluster
+                .node(NodeId(3))
+                .expect("known node")
+                .current_config()
+                .voters,
+            expected_voters,
+            "node 3 must catch up once the partition heals, even though the leader reaching it \
+             (node 4) is not a member of node 3's own stale, pre-partition view of the cluster"
         );
     }
 
