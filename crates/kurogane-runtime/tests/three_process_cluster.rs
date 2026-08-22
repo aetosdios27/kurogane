@@ -10,7 +10,11 @@
 //! a brand-new process joins as a learner via a real AddLearner RPC, gets
 //! promoted to a full voter via a real ProposeConfigChange RPC once it's
 //! actually caught up, and the resulting 4-voter cluster still makes
-//! progress on 3-of-4 after losing one of its original members.
+//! progress on 3-of-4 after losing one of its original members; (separately)
+//! killing the leader that accepted a learner's AddLearner between
+//! registration and promotion actually forces
+//! add_learner_wait_catch_up_and_promote's re-registration retry to run
+//! against a different leader, not just look correct by construction.
 
 use std::collections::BTreeMap;
 use std::net::TcpListener;
@@ -837,6 +841,204 @@ async fn a_learner_joins_gets_promoted_and_the_cluster_survives_losing_an_origin
             Instant::now() < final_deadline,
             "the surviving 3-of-4 members (two original plus the promoted learner) should still \
              make progress and replicate a new write after losing one original member"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// Proves the retry loop inside `add_learner_wait_catch_up_and_promote`
+/// (documented on that function as handling "the leader that accepted
+/// AddLearner stepped down before we could promote") actually executes
+/// against a real second leader, not just that it's correct by construction.
+/// Registers the learner against one leader, kills that exact process, then
+/// drives promotion against the survivors -- which can only succeed by
+/// re-`AddLearner`ing against whichever of them leads now, since the killed
+/// leader's `PersistLearners`/transport wiring for this learner is gone with
+/// it (leader-local state, per `add_learner_wait_catch_up_and_promote`'s own
+/// doc comment). The discriminating assertion is `assert_ne!(promoting_leader,
+/// original_leader)`: a test that only checked promotion eventually succeeds
+/// wouldn't tell "the retry path ran" apart from "promotion succeeded some
+/// other way."
+#[tokio::test]
+async fn add_learner_promotion_retries_after_the_registering_leader_is_killed() {
+    let ids = [1u64, 2, 3];
+    let learner_id = 4u64;
+
+    let peer_ports: BTreeMap<u64, u16> = ids.iter().map(|&id| (id, free_port())).collect();
+    let client_ports: BTreeMap<u64, u16> = ids.iter().map(|&id| (id, free_port())).collect();
+    let learner_peer_port = free_port();
+    let learner_client_port = free_port();
+
+    let peers = ids
+        .iter()
+        .map(|id| format!("{id}=127.0.0.1:{}", peer_ports[id]))
+        .collect::<Vec<_>>()
+        .join(",");
+    let learner_peers = ids
+        .iter()
+        .map(|id| format!("{id}=127.0.0.1:{}", peer_ports[id]))
+        .chain(std::iter::once(format!(
+            "{learner_id}=127.0.0.1:{learner_peer_port}"
+        )))
+        .collect::<Vec<_>>()
+        .join(",");
+
+    let client_addrs: BTreeMap<u64, String> = ids
+        .iter()
+        .map(|&id| (id, format!("127.0.0.1:{}", client_ports[&id])))
+        .collect();
+    let learner_client_addr = format!("127.0.0.1:{learner_client_port}");
+    let learner_peer_addr = format!("http://127.0.0.1:{learner_peer_port}");
+
+    let dirs: BTreeMap<u64, TempDir> = ids
+        .iter()
+        .map(|&id| (id, tempfile::tempdir().expect("temp dir")))
+        .collect();
+    let storage_paths: BTreeMap<u64, std::path::PathBuf> = dirs
+        .iter()
+        .map(|(&id, dir)| (id, dir.path().join("state")))
+        .collect();
+    let learner_dir = tempfile::tempdir().expect("temp dir");
+    let learner_storage_path = learner_dir.path().join("state");
+
+    let mut guard = ProcessGuard(
+        ids.iter()
+            .map(|&id| {
+                spawn_node(
+                    id,
+                    &peers,
+                    &client_addrs[&id],
+                    &storage_paths[&id],
+                    NO_COMPACTION,
+                    false,
+                )
+            })
+            .collect(),
+    );
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+
+    let seed_pairs: [(&str, &str); 3] = [("seed0", "v0"), ("seed1", "v1"), ("seed2", "v2")];
+    for (key, value) in seed_pairs {
+        propose_via_any(&client_addrs, set_command(key, value), deadline).await;
+    }
+
+    guard.0.push(spawn_node(
+        learner_id,
+        &learner_peers,
+        &learner_client_addr,
+        &learner_storage_path,
+        NO_COMPACTION,
+        true,
+    ));
+    let all_ids = [1u64, 2, 3, learner_id];
+    let new_voters = vec![1u64, 2, 3, learner_id];
+
+    // Register the learner directly (not via the combined helper) so this
+    // test can capture and then kill exactly the leader that accepted it,
+    // rather than an arbitrary/best-effort guess at current leadership.
+    let register_deadline = Instant::now() + Duration::from_secs(10);
+    let original_leader = add_learner_via_any(
+        &client_addrs,
+        learner_id,
+        &learner_peer_addr,
+        register_deadline,
+    )
+    .await;
+
+    let original_leader_index = ids.iter().position(|&id| id == original_leader).unwrap();
+    guard.0[original_leader_index]
+        .kill()
+        .expect("kill the registering leader process");
+    guard.0[original_leader_index]
+        .wait()
+        .expect("reap killed process");
+
+    let surviving_client_addrs: BTreeMap<u64, String> = client_addrs
+        .iter()
+        .filter(|&(&id, _)| id != original_leader)
+        .map(|(&id, addr)| (id, addr.clone()))
+        .collect();
+
+    // Promotion can only succeed here by re-AddLearner-ing against one of
+    // the two surviving original members -- the killed leader's learner
+    // record and transport wiring for this learner died with it.
+    let promote_deadline = Instant::now() + Duration::from_secs(20);
+    let promoting_leader = add_learner_wait_catch_up_and_promote(
+        &surviving_client_addrs,
+        learner_id,
+        &learner_peer_addr,
+        &learner_storage_path,
+        &seed_pairs,
+        new_voters.clone(),
+        promote_deadline,
+    )
+    .await;
+
+    assert_ne!(
+        promoting_leader, original_leader,
+        "promotion must have gone through a different leader than the one that registered the \
+         learner and was then killed -- proving the re-registration retry path actually ran, \
+         not just that promotion eventually succeeded some other way"
+    );
+
+    let config_commit_deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        let all_committed = all_ids
+            .iter()
+            .filter(|&&id| id != original_leader)
+            .all(|id| {
+                let path = if *id == learner_id {
+                    &learner_storage_path
+                } else {
+                    &storage_paths[id]
+                };
+                has_committed_config(path, &new_voters)
+            });
+        if all_committed {
+            break;
+        }
+        assert!(
+            Instant::now() < config_commit_deadline,
+            "the promotion's plain C_new config entry should have replicated to every surviving \
+             member before the deadline"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    let mut all_client_addrs = surviving_client_addrs.clone();
+    all_client_addrs.insert(learner_id, learner_client_addr.clone());
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    propose_via_any(
+        &all_client_addrs,
+        set_command("post-promotion", "confirmed"),
+        deadline,
+    )
+    .await;
+
+    let replicate_deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        let all_replicated = all_ids
+            .iter()
+            .filter(|&&id| id != original_leader)
+            .all(|id| {
+                let path = if *id == learner_id {
+                    &learner_storage_path
+                } else {
+                    &storage_paths[id]
+                };
+                replicated_state(path)
+                    .map(|state| state.get(b"post-promotion") == Some(b"confirmed"))
+                    .unwrap_or(false)
+            });
+        if all_replicated {
+            break;
+        }
+        assert!(
+            Instant::now() < replicate_deadline,
+            "the post-promotion write should have replicated to every surviving member, \
+             including the newly promoted learner"
         );
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
