@@ -199,10 +199,19 @@ message AddLearnerReply {
   }
 }
 
-// No fields: Node::add_learner has nothing meaningful to report back
-// beyond having accepted the request (unlike Propose, there's no log
-// index a client would ever want to poll for here).
-message AddLearnerAccepted {}
+// Node::add_learner has nothing meaningful to report back beyond having
+// accepted the request (unlike Propose, there's no log index a client
+// would ever want to poll for here) -- but the transport layer does have
+// one useful fact: whether `address` even parsed as a valid URI.
+message AddLearnerAccepted {
+  // Whether the leader's transport accepted `address` as a well-formed
+  // endpoint -- NOT confirmation that the peer is actually reachable.
+  // Connections are lazy (see GrpcPeerTransport::add_peer/new), so a
+  // syntactically valid but unreachable address still reports true here;
+  // an unreachable-but-valid learner surfaces only indirectly, as a
+  // catch-up timeout the caller must poll storage to notice.
+  bool connected = 1;
+}
 
 service RaftClient {
   rpc Propose(ProposeRequest) returns (ProposeReply);

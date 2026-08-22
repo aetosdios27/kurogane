@@ -257,8 +257,8 @@ impl RaftClient for RaftClientService {
             .ok_or_else(|| Status::unavailable("actor task is not running"))?;
 
         let result = match outcome {
-            AddLearnerOutcome::Accepted { .. } => {
-                add_learner_reply::Result::Accepted(AddLearnerAccepted {})
+            AddLearnerOutcome::Accepted { connected } => {
+                add_learner_reply::Result::Accepted(AddLearnerAccepted { connected })
             }
             AddLearnerOutcome::NotLeader(hint) => add_learner_reply::Result::NotLeader(NotLeader {
                 leader_id: hint.map(|id| id.0),

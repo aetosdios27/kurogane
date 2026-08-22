@@ -9,8 +9,8 @@ use kurogane_raft::{Message, Node, NodeId};
 use kurogane_runtime::actor::{self, Actor, PeerTransport};
 use kurogane_runtime::proto::raft_client_client::RaftClientClient;
 use kurogane_runtime::proto::raft_client_server::RaftClientServer;
-use kurogane_runtime::proto::{Command, GetCommand, ProposeRequest, SetCommand};
-use kurogane_runtime::proto::{apply_result, propose_reply};
+use kurogane_runtime::proto::{AddLearnerRequest, Command, GetCommand, ProposeRequest, SetCommand};
+use kurogane_runtime::proto::{add_learner_reply, apply_result, propose_reply};
 use kurogane_runtime::server::RaftClientService;
 use kurogane_runtime::storage::Storage;
 use tempfile::tempdir;
@@ -23,6 +23,15 @@ struct NoopTransport;
 
 impl PeerTransport for NoopTransport {
     fn send(&mut self, _to: NodeId, _message: Message) {}
+
+    // Overridden (rather than relying on the trait's always-`true` default)
+    // specifically so add_learner_reports_connected_*'s two tests below
+    // exercise real URI validation over the wire -- mirrors
+    // GrpcPeerTransport::add_peer's own check exactly, without needing a
+    // real second gRPC transport in this test.
+    fn add_peer(&mut self, _id: NodeId, address: String) -> bool {
+        tonic::transport::Endpoint::from_shared(address).is_ok()
+    }
 }
 
 /// Starts a real node behind a real TCP listener, serving only the client
@@ -152,6 +161,61 @@ async fn a_propose_returns_the_applied_value_and_a_later_get_observes_it() {
             }
         }
         other => panic!("expected an applied propose, got {other:?}"),
+    }
+}
+
+/// `connected` reports whether the supplied address parsed as a valid URI
+/// -- not whether the peer is actually reachable, since `GrpcPeerTransport`
+/// connects lazily. A well-formed-but-unreachable address (a real,
+/// syntactically valid port nothing is listening on) still reports
+/// `connected: true`.
+#[tokio::test]
+async fn add_learner_reports_connected_true_for_a_well_formed_address() {
+    let addr = spawn_server(NodeId(1), vec![NodeId(1)]).await;
+
+    let mut client = RaftClientClient::connect(format!("http://{addr}"))
+        .await
+        .expect("connect to the real listener");
+
+    let reply = client
+        .add_learner(Request::new(AddLearnerRequest {
+            node_id: 2,
+            address: "http://127.0.0.1:1".to_string(),
+        }))
+        .await
+        .expect("real RPC succeeds")
+        .into_inner();
+
+    match reply.result {
+        Some(add_learner_reply::Result::Accepted(accepted)) => {
+            assert!(accepted.connected);
+        }
+        other => panic!("expected an accepted AddLearner, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn add_learner_reports_connected_false_for_a_malformed_address() {
+    let addr = spawn_server(NodeId(1), vec![NodeId(1)]).await;
+
+    let mut client = RaftClientClient::connect(format!("http://{addr}"))
+        .await
+        .expect("connect to the real listener");
+
+    let reply = client
+        .add_learner(Request::new(AddLearnerRequest {
+            node_id: 2,
+            address: "not a url".to_string(),
+        }))
+        .await
+        .expect("real RPC succeeds")
+        .into_inner();
+
+    match reply.result {
+        Some(add_learner_reply::Result::Accepted(accepted)) => {
+            assert!(!accepted.connected);
+        }
+        other => panic!("expected an accepted AddLearner, got {other:?}"),
     }
 }
 
