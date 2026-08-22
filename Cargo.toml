@@ -4,6 +4,7 @@ members = [
     "crates/kurogane-sim",
     "crates/kurogane-kv",
     "crates/kurogane-runtime",
+    "crates/kurogane-verify",
 ]
 resolver = "3"
 

@@ -419,6 +419,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "kurogane-verify"
+version = "0.1.0"
+dependencies = [
+ "kurogane-kv",
+ "kurogane-raft",
+ "kurogane-sim",
+]
+
+[[package]]
 name = "libc"
 version = "0.2.189"
 source = "registry+https://github.com/rust-lang/crates.io-index"

@@ -140,7 +140,7 @@ pub enum ApplyResult {
 
 /// The replicated key/value map. Owns only in-memory state; persistence is
 /// milestone five's job.
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default, Eq, PartialEq, Hash)]
 pub struct StateMachine {
     entries: BTreeMap<Vec<u8>, Vec<u8>>,
     last_applied: u64,

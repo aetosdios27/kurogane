@@ -190,15 +190,21 @@ impl DurableState {
 ///
 /// Lives here, not in `kurogane-raft`: the core never reads time or randomness
 /// itself, it only receives an explicit `next_timeout` on each `Event::Tick`.
+///
+/// Public so a driver built on top of this crate's other pieces (e.g. one
+/// that schedules its own client operations and fault injection over
+/// `kurogane-kv::Replica`s rather than through `Cluster`/`Simulation`
+/// directly) draws from the exact same reproducible stream `Simulation`
+/// itself uses, instead of a second, unsynced generator.
 #[derive(Debug)]
-struct Rng(u64);
+pub struct Rng(u64);
 
 impl Rng {
-    fn new(seed: u64) -> Self {
+    pub fn new(seed: u64) -> Self {
         Self(seed)
     }
 
-    fn next_u64(&mut self) -> u64 {
+    pub fn next_u64(&mut self) -> u64 {
         self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
         let mut z = self.0;
         z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
@@ -207,7 +213,7 @@ impl Rng {
     }
 
     /// Returns a value in `[low, high]` inclusive.
-    fn range_inclusive(&mut self, low: u64, high: u64) -> u64 {
+    pub fn range_inclusive(&mut self, low: u64, high: u64) -> u64 {
         low + self.next_u64() % (high - low + 1)
     }
 }
