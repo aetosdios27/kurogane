@@ -167,23 +167,45 @@ impl RaftClient for RaftClientService {
             }
         };
 
+        // The entry this call just appended lives at (index, this_term).
+        // A leadership change before it applies can truncate and replace
+        // it with a *different* command at the same index -- Raft's Log
+        // Matching Property (same index + same term implies the same
+        // command) is what lets the check below tell "my command applied"
+        // apart from "someone else's command now occupies my index",
+        // rather than trusting `applied_result(index)` on index alone and
+        // risking handing this caller back a different command's value.
+        let expected_term = self.actor.entry_term(index).await.flatten();
+
         let result = match tokio::time::timeout(
             PROPOSE_APPLY_TIMEOUT,
             wait_for_applied(self.actor.applied_watch(), index),
         )
         .await
         {
-            Ok(true) => match self.actor.applied_result(index).await.flatten() {
-                Some(applied) => propose_reply::Result::Applied(ProposeApplied {
-                    index,
-                    result: Some(dto::apply_result_to_proto(applied)),
-                }),
-                // The watch fired but the result is already gone (a very
-                // active cluster pruned it via compaction between the two
-                // round trips) or the actor task is gone -- either way this
-                // caller genuinely can't confirm what happened, same as a
-                // plain timeout.
-                None => propose_reply::Result::Indeterminate(ProposeIndeterminate {}),
+            Ok(true) => match self.actor.entry_term(index).await.flatten() {
+                Some(term) if Some(term) == expected_term => {
+                    match self.actor.applied_result(index).await.flatten() {
+                        Some(applied) => propose_reply::Result::Applied(ProposeApplied {
+                            index,
+                            result: Some(dto::apply_result_to_proto(applied)),
+                        }),
+                        // The watch fired but the result is already gone
+                        // (a very active cluster pruned it via compaction
+                        // between round trips) or the actor task is gone
+                        // -- either way this caller genuinely can't
+                        // confirm what happened, same as a plain timeout.
+                        None => propose_reply::Result::Indeterminate(ProposeIndeterminate {}),
+                    }
+                }
+                // The term no longer matches (or the entry is gone
+                // entirely): this call's own entry was truncated and
+                // replaced by a conflicting leader before it ever
+                // committed -- it definitely never applied, but from the
+                // client's side that's indistinguishable from "still
+                // pending," so it gets the same honest Indeterminate, not
+                // a value that was never actually this call's own.
+                _ => propose_reply::Result::Indeterminate(ProposeIndeterminate {}),
             },
             // Timed out, or the watch channel closed (actor task gone):
             // this index may or may not ever apply -- see ProposeReply's

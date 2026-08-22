@@ -92,6 +92,17 @@ impl<T: PeerTransport> Actor<T> {
         self.replica.applied_result(index)
     }
 
+    /// The term the log entry at `index` currently holds, if any -- used
+    /// to tell whether an entry a caller proposed is still the one sitting
+    /// at that index later, or was truncated and replaced by a
+    /// conflicting leader in the meantime. Raft's Log Matching Property
+    /// (same index + same term implies the same command) is what makes
+    /// this a sound identity check rather than a heuristic: see
+    /// `server.rs`'s `propose` handler, the reason this exists.
+    pub fn entry_term(&self, index: u64) -> Option<u64> {
+        self.replica.node().entry_at(index).map(|entry| entry.term)
+    }
+
     /// The last leader this node has seen at a current-or-newer term, for
     /// redirecting a client `Propose` sent to the wrong node. Best-effort:
     /// it can go stale the moment the real leader changes, same as any
@@ -312,6 +323,12 @@ enum ActorRequest {
         index: u64,
         reply: tokio::sync::oneshot::Sender<Option<ApplyResult>>,
     },
+    /// Fetches the term the entry at `index` currently holds -- see
+    /// `Actor::entry_term`'s own doc comment.
+    EntryTerm {
+        index: u64,
+        reply: tokio::sync::oneshot::Sender<Option<u64>>,
+    },
 }
 
 /// A cheaply cloneable way to submit work to an actor running in its own
@@ -431,6 +448,19 @@ impl ActorHandle {
             .ok()?;
         receiver.await.ok()
     }
+
+    /// Fetches the term the entry at `index` currently holds. `None`
+    /// (outer) means the actor task is gone; `None` (inner) means there's
+    /// no entry there right now (out of range, or the index was
+    /// truncated away and nothing has replaced it yet).
+    pub async fn entry_term(&self, index: u64) -> Option<Option<u64>> {
+        let (reply, receiver) = tokio::sync::oneshot::channel();
+        self.sender
+            .send(ActorRequest::EntryTerm { index, reply })
+            .await
+            .ok()?;
+        receiver.await.ok()
+    }
 }
 
 /// The receiving half of an actor's channel. Opaque on purpose — only
@@ -513,6 +543,9 @@ pub async fn run<T: PeerTransport>(mut actor: Actor<T>, mut requests: ActorRecei
             ActorRequest::AppliedResult { index, reply } => {
                 let _ = reply.send(actor.applied_result(index).cloned());
             }
+            ActorRequest::EntryTerm { index, reply } => {
+                let _ = reply.send(actor.entry_term(index));
+            }
         }
         // Every arm above can only ever move last_applied forward (or leave
         // it unchanged) — publish it once per processed request rather than
@@ -531,7 +564,9 @@ pub async fn run<T: PeerTransport>(mut actor: Actor<T>, mut requests: ActorRecei
 
 #[cfg(test)]
 mod tests {
-    use kurogane_raft::{NodeId as RaftNodeId, RequestVoteResponse};
+    use kurogane_raft::{
+        AppendEntries, LogEntry, LogPayload, NodeId as RaftNodeId, RequestVoteResponse,
+    };
     use tempfile::tempdir;
 
     use super::*;
@@ -925,6 +960,62 @@ mod tests {
             .expect("actor task is alive")
             .expect("index has applied by the time the watch fired");
         assert_eq!(result, ApplyResult::Set { previous: None });
+    }
+
+    #[test]
+    fn entry_term_changes_once_a_conflicting_append_entries_truncates_and_replaces_the_entry() {
+        // Regression test for the exact bug server.rs's `propose` handler
+        // guards against: `applied_result(index)` alone can't tell "my
+        // command applied" apart from "a different leader's command now
+        // occupies my index" -- only the (index, term) pair can, per
+        // Raft's Log Matching Property.
+        let peers = vec![RaftNodeId(1), RaftNodeId(2), RaftNodeId(3)];
+        let mut actor = actor(RaftNodeId(1), peers, 5, 2);
+
+        let reply = actor
+            .handle_peer_request(
+                RaftNodeId(2),
+                Message::AppendEntries(AppendEntries {
+                    term: 1,
+                    leader_id: RaftNodeId(2),
+                    prev_log_index: 0,
+                    prev_log_term: 0,
+                    entries: vec![LogEntry {
+                        term: 1,
+                        payload: LogPayload::Command(vec![1]),
+                    }],
+                    leader_commit: 0,
+                }),
+            )
+            .expect("handle peer request")
+            .expect("a recognized member's AppendEntries always gets a reply");
+        assert!(matches!(reply, Message::AppendEntriesResponse(_)));
+        assert_eq!(actor.entry_term(1), Some(1));
+
+        // A higher-term leader's conflicting entry at the same index
+        // truncates and replaces it.
+        actor
+            .handle_peer_request(
+                RaftNodeId(3),
+                Message::AppendEntries(AppendEntries {
+                    term: 2,
+                    leader_id: RaftNodeId(3),
+                    prev_log_index: 0,
+                    prev_log_term: 0,
+                    entries: vec![LogEntry {
+                        term: 2,
+                        payload: LogPayload::Command(vec![2]),
+                    }],
+                    leader_commit: 0,
+                }),
+            )
+            .expect("handle peer request");
+
+        assert_eq!(
+            actor.entry_term(1),
+            Some(2),
+            "the original term-1 entry must no longer be what's at index 1"
+        );
     }
 
     #[test]
