@@ -46,5 +46,3 @@ cargo fmt --all -- --check                           # formatting check
 cargo test --workspace                                # run all tests
 cargo clippy --workspace --all-targets -- -D warnings  # lint, warnings are errors
 ```
-
-See `CLAUDE.md` for full architectural detail.
