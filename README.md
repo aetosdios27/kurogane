@@ -37,6 +37,16 @@ crates/
 
 `kurogane-sim`, `kurogane-kv`, and `kurogane-runtime` depend one-directionally on `kurogane-raft`, which depends on nothing but the standard library — no async runtime, sockets, wall-clock timers, random source, or protobuf. `kurogane-verify` depends on `kurogane-sim` and `kurogane-kv`. `unsafe_code = "forbid"` is set workspace-wide.
 
+## Architecture
+
+- **`kurogane-raft`** — protocol types, node state, and synchronous state transitions (`Node::step`, `Node::propose`, `Node::recover`, `Node::compact`). Time and randomness only ever enter as explicit inputs, never read internally; persistence is the same shape — `PersistHardState`/`PersistLog`/`PersistSnapshot` are effects the owner must honor, not I/O this crate performs itself.
+- **`kurogane-sim`** — deterministic cluster ownership, scheduling, fault injection, traces, and invariant checks for the raft layer, plus simulated-disk state and node replacement for crash-and-recovery tests.
+- **`kurogane-kv`** — the replicated key/value state machine: `Command` (`Set`/`Delete`/`Get`), `StateMachine` (applies committed entries one at a time, snapshots/restores for compaction), and `Replica` (wraps a `Node`, auto-drains newly committed entries into the state machine).
+- **`kurogane-runtime`** — the real (non-simulated) runtime adapter: Tokio task ownership, gRPC transport, and file-based storage. The one place Tokio, tonic, and prost are allowed. Owns protobuf conversions, file-based persistence, the actor that exclusively owns one `Replica` per process, the gRPC peer/client services, the wall-clock timer, and the `kurogane-node` binary.
+- **`kurogane-verify`** — a deterministic-but-fault-injecting harness over real `kurogane-kv::Replica`s, plus a hand-rolled linearizability checker over the client-visible histories it produces.
+
+Node transitions are effect-driven: a `Node` consumes an `Event` (`Tick` or `Step` with a `Message`) and emits `Effect`s (e.g. `Send`) for its owner to interpret, rather than performing I/O itself. Reads (`Command::Get`) are routed through the log like writes rather than served from local state — the simplest proven linearizable-read mechanism, deliberately not the faster heartbeat-lease optimization.
+
 ## Development
 
 Requires Rust 1.85+ (edition 2024).
